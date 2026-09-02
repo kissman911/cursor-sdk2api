@@ -23,7 +23,8 @@ import type { PumpBoundary } from "../core/event-pump.js";
 import { LineageStore } from "../core/lineage-store.js";
 import { OrdinaryTurnJournal } from "../core/ordinary-turn-journal.js";
 import { RuntimeLedger } from "../core/runtime-ledger.js";
-import { inspectSandLoader, type SandLoaderHealth } from "../sdk/sand-loader.js";
+import type { SandLoaderHealth } from "../sdk/sand-loader.js";
+import { inspectSandInference } from "../sdk/sand-inference-runtime.js";
 import { SessionRegistry } from "../core/session-registry.js";
 import {
   forbiddenError,
@@ -147,7 +148,7 @@ export function createApp(input: {
 }): App {
   const { config, sdk, clock, logger, workspaceDir, beforeApplyBoundary } = input;
   const fetchSandQuota = input.fetchSandQuota ?? fetchCursorSandQuota;
-  const sandHealth = input.sandHealth ?? inspectSandLoader();
+  const sandHealth = input.sandHealth ?? inspectSandInference();
   const assertSandAccess = input.assertSandAccess ?? (async (apiKey: string) => {
     const quota = await fetchSandQuota(apiKey);
     if (!quota.available) throw forbiddenError("Sand is unavailable until Grok Bot access is granted");
@@ -406,6 +407,9 @@ export function createApp(input: {
                 ready: sandHealth.ready,
                 sdk_version: sandHealth.sdk_version,
                 patch_contract_version: sandHealth.patch_contract_version,
+                ...(sandHealth.transport ? { transport: sandHealth.transport } : {}),
+                ...(sandHealth.client_version ? { client_version: sandHealth.client_version } : {}),
+                ...(sandHealth.capabilities ? { capabilities: sandHealth.capabilities } : {}),
                 ...(sandHealth.ready || !sandHealth.reason ? {} : { reason: sandHealth.reason }),
               },
             },

@@ -9,6 +9,7 @@ import { loadConfig, type GatewayConfig } from "../../src/config.js";
 import { createLogger } from "../../src/log.js";
 import type { PumpBoundary } from "../../src/core/event-pump.js";
 import { createApp, type App } from "../../src/server/app.js";
+import { inspectSandInference } from "../../src/sdk/sand-inference-runtime.js";
 import { FakeSdk, type FakeSdkOptions } from "../fixtures/fake-sdk.js";
 
 export interface TestContext {
@@ -64,11 +65,7 @@ export async function startTestApp(
     workspaceDir: mkdtempSync(join(tmpdir(), "cursor-sdk2api-test-")),
     beforeApplyBoundary: options.beforeApplyBoundary,
     fetchSandQuota: options.fetchSandQuota ?? (async () => UNAVAILABLE_GROK_BOT),
-    sandHealth: options.sandHealth ?? {
-      ready: true,
-      sdk_version: "1.0.30",
-      patch_contract_version: "1.0.30",
-    },
+    sandHealth: options.sandHealth ?? inspectSandInference(),
     assertSandAccess: options.assertSandAccess,
   });
   const server = createServer((req, res) => {

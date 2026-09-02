@@ -326,11 +326,30 @@ export async function createSandSdkClone(options: {
   };
 }
 
+/**
+ * Readiness of the `sand` runtime profile as reported by `/health` and
+ * consulted before every Sand run.
+ *
+ * The hash-guarded SDK clone (`inspectSandLoader`) is retained for tooling and
+ * tests, but production Sand runs no longer use it: Cursor rejects the `sand`
+ * client type on `agent.v1.AgentService/Run`, so the profile is served by the
+ * `aiserver.v1.InferenceService/Stream` transport instead. Fields other than
+ * `ready` are descriptive.
+ */
 export interface SandLoaderHealth {
   ready: boolean;
   sdk_version: string;
   patch_contract_version: string;
   reason?: SandLoaderMismatchReason;
+  transport?: string;
+  client_version?: string;
+  capabilities?: {
+    text: boolean;
+    thinking: boolean;
+    tools: boolean;
+    images: boolean;
+    cross_process_resume: boolean;
+  };
 }
 
 export function inspectSandLoader(sourceDir?: string): SandLoaderHealth {

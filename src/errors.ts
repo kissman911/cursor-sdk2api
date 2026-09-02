@@ -63,6 +63,17 @@ export function upstreamError(message: string, status = 502): GatewayError {
   return new GatewayError("cursor_upstream_error", message, status);
 }
 
+/**
+ * Cursor's server-side Agent harness (agent.v1.AgentService/Run) refuses the
+ * `sand` client type outright. Grok Bot quota is only billable on the
+ * aiserver.v1.InferenceService transport, so this failure is about the
+ * transport, not the account's Grok Bot grant.
+ */
+export const SAND_ENDPOINT_REJECTED_MESSAGE =
+  "Cursor rejected Sand (Grok Bot) traffic on the SDK Agent endpoint: " +
+  "agent.v1.AgentService/Run does not bill Grok Bot quota. " +
+  "This is a transport limitation, not an account-level restriction";
+
 export function sdkFailure(error: unknown): GatewayError {
   if (error instanceof GatewayError) return error;
   const message = redactSecrets(error instanceof Error ? error.message : String(error ?? "SDK error"));
@@ -78,7 +89,7 @@ export function sdkFailure(error: unknown): GatewayError {
     return rateLimited(message);
   }
   if (/Sand traffic is not supported/i.test(message)) {
-    return forbiddenError("Sand is not supported for this Cursor account");
+    return forbiddenError(SAND_ENDPOINT_REJECTED_MESSAGE);
   }
   if (/not supported in your region|model not available|permission|forbidden|not allowed/i.test(message)) {
     return forbiddenError(message);

@@ -110,7 +110,7 @@ interface ExchangeErrorOptions {
   cause?: unknown;
 }
 
-class ExchangeError extends Error {
+export class ExchangeError extends Error {
   readonly status?: number;
 
   constructor(options: ExchangeErrorOptions = {}) {
@@ -197,10 +197,15 @@ async function readLimitedJson(response: Response): Promise<Record<string, unkno
   return parsed as Record<string, unknown>;
 }
 
-async function exchangeApiKey(
+/**
+ * Exchange a Cursor User API Key for a short-lived access token. Shared by the
+ * Dashboard RPCs and the Sand inference transport; concurrent callers for the
+ * same credential are coalesced into one upstream exchange.
+ */
+export async function exchangeApiKey(
   apiKey: string,
-  baseUrl: string,
-  request: typeof globalThis.fetch,
+  baseUrl: string = DEFAULT_BASE_URL,
+  request: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<string> {
   const fingerprint = `${baseUrl}:${credentialFingerprint(apiKey)}`;
   const existing = activeExchanges.get(fingerprint);

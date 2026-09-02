@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "vitest";
+import { SAND_ENDPOINT_REJECTED_MESSAGE } from "../../src/errors.js";
 import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 let ctx: TestContext;
@@ -7,7 +8,7 @@ afterEach(async () => {
   if (ctx) await closeTestApp(ctx);
 });
 
-test("Cursor rejecting Sand traffic maps to a public forbidden error", async () => {
+test("Cursor rejecting Sand traffic maps to a forbidden error that names the transport, not the account", async () => {
   ctx = await startTestApp({
     config: { runtimePolicy: { defaultProfile: "sand", allowRequestOverride: false, hostedSearchMode: "off" } },
     assertSandAccess: async () => undefined,
@@ -26,8 +27,10 @@ test("Cursor rejecting Sand traffic maps to a public forbidden error", async () 
   const body = (await res.json()) as { error: { type: string; message: string } };
   expect(res.status).toBe(403);
   expect(body.error.type).toBe("forbidden");
-  expect(body.error.message).toBe("Sand is not supported for this Cursor account");
-  expect(JSON.stringify(body)).not.toMatch(/endpoint/i);
+  expect(body.error.message).toBe(SAND_ENDPOINT_REJECTED_MESSAGE);
+  expect(body.error.message).toMatch(/agent\.v1\.AgentService\/Run/);
+  expect(body.error.message).toMatch(/not an account-level restriction/i);
+  expect(body.error.message).not.toMatch(/for this Cursor account/i);
 });
 
 test("regional model unavailability is a forbidden capability error", async () => {

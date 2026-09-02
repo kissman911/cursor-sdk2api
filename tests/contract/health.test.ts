@@ -81,12 +81,33 @@ test("health reports runtime capability truth without account data", async () =>
   expect(JSON.stringify(body)).not.toContain("spending");
   expect(JSON.stringify(body)).not.toContain("email");
   expect(JSON.stringify(body)).not.toMatch(/\/Users\/|node_modules|STATE_DIR|sand-sdk/);
-  const profiles = (body as { profiles?: { default?: string; sdk?: { ready?: boolean }; sand?: { ready?: boolean; sdk_version?: string; patch_contract_version?: string } } }).profiles;
+  const profiles = (body as {
+    profiles?: {
+      default?: string;
+      sdk?: { ready?: boolean };
+      sand?: {
+        ready?: boolean;
+        sdk_version?: string;
+        patch_contract_version?: string;
+        transport?: string;
+        client_version?: string;
+        capabilities?: Record<string, boolean>;
+      };
+    };
+  }).profiles;
   expect(profiles?.default).toBe("sdk");
   expect(profiles?.sdk?.ready).toBe(true);
   expect(profiles?.sand?.sdk_version).toBe("1.0.30");
-  expect(profiles?.sand?.patch_contract_version).toBe("1.0.30");
-  expect(typeof profiles?.sand?.ready).toBe("boolean");
+  expect(profiles?.sand?.ready).toBe(true);
+  expect(profiles?.sand?.transport).toBe("aiserver.v1.InferenceService/Stream");
+  expect(profiles?.sand?.client_version).toBe("sdk-1.0.30");
+  expect(profiles?.sand?.capabilities).toEqual({
+    text: true,
+    thinking: true,
+    tools: false,
+    images: false,
+    cross_process_resume: false,
+  });
 });
 
 test("health capabilities follow runtime config, not marketing constants", async () => {

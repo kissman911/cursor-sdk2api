@@ -22,7 +22,7 @@ LABEL org.opencontainers.image.title="cursor-sdk2api" \
 COPY --from=build --chown=65532:65532 /app/node_modules ./node_modules
 COPY --from=build --chown=65532:65532 /app/dist ./dist
 COPY --from=build --chown=65532:65532 /app/data /data
-COPY --chown=65532:65532 LICENSE NOTICE.md README.md README.zh-CN.md ./
+COPY --chown=65532:65532 LICENSE NOTICE.md README.md README.zh-CN.md package.json ./
 ENV STATE_DIR=/data
 EXPOSE 8080
 VOLUME ["/data"]

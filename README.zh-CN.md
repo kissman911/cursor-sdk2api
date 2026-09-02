@@ -33,7 +33,7 @@
 - **一把网关 Key，多账号共用：** Cursor 账号池持久化、按模型 round-robin、SDK 陈旧登录态恢复、语义输出前账号故障转移、Dashboard 额度、Web 控制台和 Docker。
 - **续轮冷恢复：** 客户端携带完整 transcript 时，可以重建过期或迁移的工具轮；已经执行过的同一工具由网关内部回放结果，不重复产生副作用。
 - **已集成 new-api：** 已提供外置部署、渠道模板、compose E2E 和验收 smoke。[直接查看 new-api 接入指南](docs/NEW_API_INTEGRATION.md)。
-- **运行方式：** 默认 `sdk`。显式 `sand` 使用 hash 守卫的 Cursor Sand 客户端、隔离 store/workspace，并要求 Grok Bot 授权；不会静默互退。
+- **运行方式：** 默认 `sdk`。显式 `sand` 消耗账号的 **Grok Bot 周额度**：走 `aiserver.v1.InferenceService/Stream` 直连传输（Cursor 在 SDK 的 Agent 端点上拒绝 Sand 流量），要求 Grok Bot 授权，且**仅支持文本与 thinking**——模型无法调用客户端工具、忽略图片、Agent 仅驻留进程内（重启后按完整 transcript 冷重建）。不会在 `sdk` 与 `sand` 之间静默互退。
 - **耐久 Run：** 可选 SQLite 账本（`RUNTIME_LEDGER_V2=1`）保证同一逻辑请求只 Send 一次，断线后继续观察到终态并写出一条 receipt。
 - **Responses Compact：** `POST /v1/responses/compact` 返回唯一网关本地 `csgw1.` compaction item，不第二次 Cursor Send。
 

@@ -30,6 +30,37 @@ Text/thinking streaming uses official `SendOptions.onDelta` (`text-delta` / `thi
 
 `SdkRunDriver` maps one custom-tool table before Agent create/resume and carries that same table through `send()` and EventPump attachment. Tool callbacks that fire synchronously during Agent resume or send are queued on the Session and drained only after the pump is attached; the coordinator never remaps tools or calls `Agent.resume` directly.
 
+## Sand (Grok Bot) transport
+
+The `sand` runtime profile does not use `@cursor/sdk` Agents. Cursor's server-side
+harness (`agent.v1.AgentService/Run`) rejects `x-cursor-client-type: sand` with
+`Sand traffic is not supported on this endpoint`; Grok Bot quota is billed only
+on `aiserver.v1.InferenceService/Stream`. `SandInferenceRuntime`
+(`src/sdk/sand-inference-runtime.ts`) implements the same `SdkAgent`/`SdkRun`
+port over that RPC, so RunCoordinator, EventPump, ToolBridge, and every protocol
+writer are unchanged:
+
+- Auth: the User API Key is exchanged for an access token through the same
+  `exchangeApiKey` the Dashboard quota reads use; one 401/403 triggers exactly one
+  refresh before any semantic output.
+- Wire: Connect streaming (`application/connect+proto`), hand-rolled protobuf in
+  `src/sdk/sand-inference-codec.ts` (request: messages/role+text, requestedModel
+  + params, conversationId; response: text part, thinking part, usage, error).
+  Headers: `x-cursor-client-type: sand`, `x-cursor-client-version: sdk-1.0.30`,
+  `x-sand-box-namespace: prod`, `x-ghost-mode: true`. Bare desktop versions are
+  rejected as ERROR_OUTDATED_CLIENT.
+- Semantics: text and thinking deltas flow through `onDelta` exactly like the
+  SDK path. The transport has no tool calls: client tool catalogs are still
+  rendered into the prompt, but the model cannot invoke them. Images are dropped.
+- State: a Sand Agent is an in-memory message history keyed by agent id and
+  credential. Exact live successors reuse it via `send()`; after a process
+  restart `Agent.resume` is refused and the coordinator's existing full-transcript
+  cold rebuild takes over. Nothing is written to the SDK store.
+- Health: `/health.profiles.sand` reports `transport`, `client_version`, and a
+  `capabilities` envelope (`tools: false`, `images: false`,
+  `cross_process_resume: false`). The hash-guarded SDK clone
+  (`sand-loader.ts`) is no longer on the request path.
+
 ## Network transport
 
 Direct local SDK runs retain the official HTTP/2 transport. Node does not apply

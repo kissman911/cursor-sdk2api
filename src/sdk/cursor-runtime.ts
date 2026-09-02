@@ -1,6 +1,5 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { Agent, Cursor, JsonlLocalAgentStore, type Run, type SDKAgent } from "@cursor/sdk";
 import {
   ambientDisallowedTools,
@@ -23,7 +22,7 @@ import { ensurePrivateDir } from "../core/lineage-store.js";
 import { DEFAULT_RUNTIME_PROFILE, type RuntimeProfile } from "../core/runtime-profile.js";
 import { credentialFingerprint } from "../digest.js";
 import { fetchCursorDashboardQuota } from "../account/cursor-dashboard.js";
-import { ensureSandSdkClone } from "./sand-loader.js";
+import { SandInferenceRuntime } from "./sand-inference-runtime.js";
 import { sandStoreDir, sandWorkspaceDir } from "./sand-paths.js";
 
 const require = createRequire(import.meta.url);
@@ -221,27 +220,16 @@ export function agentResourceDirs(input: {
   };
 }
 
-type CursorAgentApi = {
-  create: typeof Agent.create;
-  resume: typeof Agent.resume;
-};
-
-let sandAgentApi: Promise<CursorAgentApi> | undefined;
-
-async function sandAgentBindings(stateDir: string): Promise<CursorAgentApi> {
-  sandAgentApi ??= (async () => {
-    const cloneDir = await ensureSandSdkClone(stateDir);
-    const mod = (await import(pathToFileURL(join(cloneDir, "dist/esm/index.js")).href)) as {
-      Agent: typeof Agent;
-    };
-    return { create: mod.Agent.create.bind(mod.Agent), resume: mod.Agent.resume.bind(mod.Agent) };
-  })();
-  return sandAgentApi;
-}
-
-export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
+export function createCursorRuntime(options: {
+  stateDir: string;
+  sandRuntime?: SandInferenceRuntime;
+}): SdkRuntime {
   const sdkStoreRoot = join(options.stateDir, "sdk-store");
   ensurePrivateDir(sdkStoreRoot);
+  // Grok Bot (Sand) quota is only billable on aiserver.v1.InferenceService.
+  // The SDK's agent.v1.AgentService/Run transport rejects the `sand` client
+  // type outright, so the sand profile never touches @cursor/sdk Agents.
+  const sandRuntime = options.sandRuntime ?? new SandInferenceRuntime();
   const tenantResources = (apiKey: string, workspaceRoot: string, profile?: RuntimeProfile) => {
     const dirs = agentResourceDirs({
       stateDir: options.stateDir,
@@ -258,10 +246,15 @@ export function createCursorRuntime(options: { stateDir: string }): SdkRuntime {
   };
   const bindAgent = async (input: CreateAgentInput | ResumeAgentInput, kind: "create" | "resume"): Promise<SdkAgent> => {
     const profile = input.runtimeProfile ?? DEFAULT_RUNTIME_PROFILE;
+    if (profile === "sand") {
+      return kind === "resume" && "agentId" in input
+        ? sandRuntime.resumeAgent(input)
+        : sandRuntime.createAgent(input);
+    }
     const hostedSearch = input.hostedSearch === true;
     const customTools = input.customTools;
     const resources = tenantResources(input.apiKey, input.workspaceDir, profile);
-    const api = profile === "sand" ? await sandAgentBindings(options.stateDir) : { create: Agent.create, resume: Agent.resume };
+    const api = { create: Agent.create, resume: Agent.resume };
     const local = {
       cwd: resources.workspaceDir,
       settingSources: [],
