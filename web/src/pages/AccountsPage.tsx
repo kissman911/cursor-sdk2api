@@ -1,11 +1,12 @@
 import { Button } from "../bflabs/Button";
 import type { RosterItem } from "../roster";
-import { AccountTable } from "./AccountTable";
+import { AccountTable, type PoolStateCopy } from "./AccountTable";
 import type { HomeCopy } from "./HomePage";
 import { ActionLink, PageFrame } from "./shared";
 
 export function AccountsPage({
   t,
+  poolState,
   draftKey,
   addError,
   adding,
@@ -14,8 +15,10 @@ export function AccountsPage({
   onAdd,
   onTest,
   onRemove,
+  onToggleEnabled,
 }: {
-  t: HomeCopy & { add: string; adding: string; keyPlaceholder: string; keyHelp: string; remove: string };
+  t: HomeCopy & { add: string; adding: string; keyPlaceholder: string; keyHelp: string; remove: string; poolHelp: string };
+  poolState: PoolStateCopy;
   draftKey: string;
   addError: string;
   adding: boolean;
@@ -24,9 +27,11 @@ export function AccountsPage({
   onAdd: () => void;
   onTest: (id: string) => void;
   onRemove: (id: string) => void;
+  onToggleEnabled: (id: string, enabled: boolean) => void;
 }) {
   const passed = roster.filter((item) => item.testState === "pass").length;
   const failed = roster.filter((item) => item.testState === "fail").length;
+  const resting = roster.filter((item) => item.state !== "active").length;
   return (
     <PageFrame
       kicker={t.manage}
@@ -58,6 +63,7 @@ export function AccountsPage({
       </form>
       {addError ? <p className="field-error" role="alert">{addError}</p> : null}
       <p className="note">{t.keyHelp}</p>
+      <p className="note">{t.poolHelp.replace("{n}", String(resting))}</p>
       {roster.length === 0 ? <p className="empty">{t.noAccounts}</p> : (
         <AccountTable
           items={roster}
@@ -73,8 +79,10 @@ export function AccountsPage({
           open={t.open}
           remove={t.remove}
           headers={t.headers}
+          poolState={poolState}
           onTest={onTest}
           onRemove={onRemove}
+          onToggleEnabled={onToggleEnabled}
         />
       )}
     </PageFrame>

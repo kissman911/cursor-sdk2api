@@ -161,8 +161,8 @@ test("without an onDelta sink, text and thinking are emitted on run.stream()", a
   expect((await run.wait()).result).toBe("x");
 });
 
-test("end-stream errors become typed gateway failures and do not extend history", async () => {
-  const { runtime } = runtimeWith(() =>
+test("end-stream errors before any content are thrown from send() as typed gateway failures", async () => {
+  const { runtime, calls } = runtimeWith(() =>
     protoResponse([
       endFrame({
         error: {
@@ -174,26 +174,50 @@ test("end-stream errors become typed gateway failures and do not extend history"
     ]),
   );
   const agent = runtime.createAgent(createInput);
-  const run = await agent.send({ text: "hi", onDelta: () => undefined });
-  for await (const _ of run.stream()) {
-    // drain
-  }
-  const result = await run.wait();
-  expect(result.status).toBe("error");
-  expect(result.error?.code).toBe("forbidden");
-  expect(result.error?.message).toMatch(/ERROR_OUTDATED_CLIENT/);
+  await expect(agent.send({ text: "hi", onDelta: () => undefined })).rejects.toMatchObject({
+    code: "forbidden",
+    message: expect.stringMatching(/ERROR_OUTDATED_CLIENT/),
+  });
+  // History is untouched: the next send carries only the new user turn.
+  expect(calls).toHaveLength(1);
 });
 
-test("in-band error frames and rate limits map to upstream and rate_limited codes", async () => {
+test("pre-content in-band errors and quota rejections are thrown from send() so the pool can fail over", async () => {
   const inBand = runtimeWith(() => protoResponse([encodeConnectEnvelope(errorFrame("model exploded")), endFrame()]));
-  const run = await inBand.runtime.createAgent(createInput).send({ text: "hi", onDelta: () => undefined });
-  expect((await run.wait()).error).toEqual({ message: "model exploded", code: "cursor_upstream_error" });
+  await expect(inBand.runtime.createAgent(createInput).send({ text: "hi", onDelta: () => undefined })).rejects.toMatchObject({
+    code: "cursor_upstream_error",
+    message: "model exploded",
+  });
 
   const limited = runtimeWith(() =>
-    protoResponse([endFrame({ error: { code: "resource_exhausted", message: "ERROR_USAGE_LIMIT" } })]),
+    protoResponse([
+      endFrame({
+        error: {
+          code: "resource_exhausted",
+          message: "ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: You've reached your Grok Bot usage limit. It resets in 7 days.",
+        },
+      }),
+    ]),
   );
-  const limitedRun = await limited.runtime.createAgent(createInput).send({ text: "hi", onDelta: () => undefined });
-  expect((await limitedRun.wait()).error?.code).toBe("rate_limited");
+  await expect(limited.runtime.createAgent(createInput).send({ text: "hi", onDelta: () => undefined })).rejects.toMatchObject({
+    code: "rate_limited",
+    message: expect.stringMatching(/Grok Bot usage limit/),
+  });
+});
+
+test("errors after content has started are reported through the run, not thrown from send()", async () => {
+  const { runtime } = runtimeWith(() =>
+    protoResponse([
+      encodeConnectEnvelope(textFrame("partial")),
+      endFrame({ error: { code: "internal", message: "stream broke" } }),
+    ]),
+  );
+  const deltas: SdkDeltaUpdate[] = [];
+  const run = await runtime.createAgent(createInput).send({ text: "hi", onDelta: (update) => void deltas.push(update) });
+  const result = await run.wait();
+  expect(result.status).toBe("error");
+  expect(result.error?.message).toMatch(/stream broke/);
+  expect(deltas).toEqual([{ type: "text-delta", text: "partial" }]);
 });
 
 test("HTTP 401 triggers exactly one token refresh and retry before any semantic output", async () => {
@@ -261,6 +285,222 @@ test("cancel aborts the upstream stream and reports a cancelled run", async () =
   expect((await run.wait()).status).toBe("cancelled");
 });
 
+function decodeMessages(body: Uint8Array): Array<{ role: number; text: string }> {
+  const [envelope] = new ConnectEnvelopeReader().push(body);
+  const bytes = envelope!.payload;
+  const out: Array<{ role: number; text: string }> = [];
+  let offset = 0;
+  const varint = () => {
+    let result = 0;
+    let shift = 0;
+    for (;;) {
+      const byte = bytes[offset++]!;
+      result |= (byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return result >>> 0;
+      shift += 7;
+    }
+  };
+  while (offset < bytes.length) {
+    const key = varint();
+    const field = key >>> 3;
+    const wire = key & 7;
+    if (wire !== 2) {
+      if (wire === 0) varint();
+      continue;
+    }
+    const length = varint();
+    const inner = bytes.subarray(offset, offset + length);
+    offset += length;
+    if (field !== 1) continue;
+    let role = 0;
+    let text = "";
+    let cursor = 0;
+    while (cursor < inner.length) {
+      let k = 0;
+      let s = 0;
+      let b: number;
+      do {
+        b = inner[cursor++]!;
+        k |= (b & 0x7f) << s;
+        s += 7;
+      } while (b & 0x80);
+      const f = k >>> 3;
+      if ((k & 7) === 0) {
+        let v = 0;
+        let vs = 0;
+        do {
+          b = inner[cursor++]!;
+          v |= (b & 0x7f) << vs;
+          vs += 7;
+        } while (b & 0x80);
+        if (f === 1) role = v;
+      } else {
+        let l = 0;
+        let ls = 0;
+        do {
+          b = inner[cursor++]!;
+          l |= (b & 0x7f) << ls;
+          ls += 7;
+        } while (b & 0x80);
+        if (f === 2) text = new TextDecoder().decode(inner.subarray(cursor, cursor + l));
+        cursor += l;
+      }
+    }
+    out.push({ role, text });
+  }
+  return out;
+}
+
+const toolCall = (name: string, input: Record<string, unknown>) =>
+  `<sand:tool_call>${JSON.stringify({ name, input })}</sand:tool_call>`;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+test("tool call blocks become customTool executions, results flow back, and only prose reaches the client", async () => {
+  const { runtime, calls } = runtimeWith((_, index) => {
+    if (index === 0) {
+      return protoResponse([
+        encodeConnectEnvelope(thinkingFrame("plan")),
+        encodeConnectEnvelope(textFrame("Checking memory.\n")),
+        encodeConnectEnvelope(textFrame("<sand:tool_")),
+        encodeConnectEnvelope(textFrame(`call>${JSON.stringify({ name: "Bash", input: { command: "free -h" } })}</sand:tool_call>\n`)),
+        encodeConnectEnvelope(textFrame(toolCall("Read", { file_path: "/tmp/MEMORY.md" }))),
+        encodeConnectEnvelope(usageFrame()),
+        endFrame(),
+      ]);
+    }
+    return protoResponse([encodeConnectEnvelope(textFrame("RAM is fine.")), encodeConnectEnvelope(usageFrame()), endFrame()]);
+  });
+  const bash = deferred<string>();
+  const read = deferred<string>();
+  const executed: Array<{ name: string; args: Record<string, unknown>; id?: string }> = [];
+  const customTools = {
+    Bash: {
+      description: "Run a command",
+      inputSchema: { type: "object", properties: { command: { type: "string" } } },
+      execute: (args: Record<string, unknown>, context: { toolCallId?: string }) => {
+        executed.push({ name: "Bash", args, id: context.toolCallId });
+        return bash.promise;
+      },
+    },
+    Read: {
+      execute: (args: Record<string, unknown>, context: { toolCallId?: string }) => {
+        executed.push({ name: "Read", args, id: context.toolCallId });
+        return read.promise.then((text) => ({ content: [{ type: "text" as const, text }] }));
+      },
+    },
+  };
+  const agent = runtime.createAgent({ ...createInput, customTools });
+  const deltas: SdkDeltaUpdate[] = [];
+  const run = await agent.send({ text: "Does memory need cleaning?", customTools, onDelta: (update) => void deltas.push(update) });
+
+  // Both calls are handed over together, before any result exists.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(executed.map((call) => call.name)).toEqual(["Bash", "Read"]);
+  expect(executed[0]?.args).toEqual({ command: "free -h" });
+  expect(executed[1]?.args).toEqual({ file_path: "/tmp/MEMORY.md" });
+  expect(executed[0]?.id).toMatch(/^toolu_/);
+  expect(executed[0]?.id).not.toBe(executed[1]?.id);
+  expect(calls).toHaveLength(1);
+  expect(deltas).toEqual([
+    { type: "thinking-delta", text: "plan" },
+    { type: "text-delta", text: "Checking memory.\n" },
+  ]);
+
+  bash.resolve("Mem: 62Gi total, 40Gi free");
+  read.resolve("# memory notes");
+  const result = await run.wait();
+  expect(result.status).toBe("finished");
+  expect(result.result).toBe("RAM is fine.");
+  expect(result.usage).toEqual({ inputTokens: 48, outputTokens: 222, totalTokens: 270 });
+  expect(deltas.slice(2)).toEqual([
+    { type: "text-delta", text: "RAM is fine." },
+    { type: "turn-ended", usage: { inputTokens: 48, outputTokens: 222, totalTokens: 270 } },
+  ]);
+
+  // Second round trip: protocol system message, the original turn, the raw assistant text, and tagged results.
+  expect(calls).toHaveLength(2);
+  const second = decodeMessages(calls[1]!.body);
+  expect(second[0]?.role).toBe(4);
+  expect(second[0]?.text).toContain("# Tool calling protocol");
+  expect(second[0]?.text).toContain('"name": "Bash"');
+  expect(second[1]).toEqual({ role: 1, text: "Does memory need cleaning?" });
+  expect(second[2]?.role).toBe(2);
+  expect(second[2]?.text).toContain("Checking memory.");
+  expect(second[2]?.text).toContain(toolCall("Bash", { command: "free -h" }));
+  expect(second[3]?.role).toBe(1);
+  expect(second[3]?.text).toContain(`<sand:tool_result id="${executed[0]!.id}" name="Bash" is_error="false">\nMem: 62Gi total, 40Gi free\n</sand:tool_result>`);
+  expect(second[3]?.text).toContain(`<sand:tool_result id="${executed[1]!.id}" name="Read" is_error="false">\n# memory notes\n</sand:tool_result>`);
+
+  // The committed history carries the whole loop so a follow-up send() replays it.
+  await (await agent.send({ text: "thanks", customTools, onDelta: () => undefined })).wait();
+  const third = decodeMessages(calls[2]!.body);
+  expect(third.map((message) => message.role)).toEqual([4, 1, 2, 1, 2, 1]);
+  expect(third[4]?.text).toBe("RAM is fine.");
+  expect(third[5]?.text).toBe("thanks");
+});
+
+test("without tools the request carries no protocol message and tags are ordinary text", async () => {
+  const { runtime, calls } = runtimeWith(() =>
+    protoResponse([encodeConnectEnvelope(textFrame("<sand:tool_call>literal</sand:tool_call>")), endFrame()]),
+  );
+  const run = await runtime.createAgent(createInput).send({ text: "hi", onDelta: () => undefined });
+  expect((await run.wait()).result).toBe("<sand:tool_call>literal</sand:tool_call>");
+  expect(decodeMessages(calls[0]!.body)).toEqual([{ role: 1, text: "hi" }]);
+});
+
+test("a step with only malformed calls is re-prompted with feedback, then surfaced as text", async () => {
+  const bad = "<sand:tool_call>{not json}</sand:tool_call>";
+  const { runtime, calls } = runtimeWith(() => protoResponse([encodeConnectEnvelope(textFrame(bad)), endFrame()]));
+  const customTools = { Bash: { execute: () => "never" } };
+  const deltas: SdkDeltaUpdate[] = [];
+  const run = await runtime.createAgent({ ...createInput, customTools }).send({
+    text: "go",
+    customTools,
+    onDelta: (update) => void deltas.push(update),
+  });
+  const result = await run.wait();
+  expect(result.status).toBe("finished");
+  // 1 attempt + 2 retries, each fed the parse error as a tool result.
+  expect(calls).toHaveLength(3);
+  const retry = decodeMessages(calls[1]!.body);
+  expect(retry.at(-1)?.role).toBe(1);
+  expect(retry.at(-1)?.text).toContain('id="malformed-1"');
+  expect(retry.at(-1)?.text).toContain("not a valid JSON object");
+  expect(result.result).toBe(bad);
+  expect(deltas).toEqual([{ type: "text-delta", text: bad }, { type: "turn-ended" }]);
+});
+
+test("cancelling while a tool result is outstanding ends the run without another round trip", async () => {
+  const { runtime, calls } = runtimeWith(() =>
+    protoResponse([encodeConnectEnvelope(textFrame(toolCall("Bash", { command: "sleep" }))), endFrame()]),
+  );
+  const never = new Promise<string>(() => undefined);
+  const customTools = { Bash: { execute: () => never } };
+  const run = await runtime.createAgent({ ...createInput, customTools }).send({ text: "go", customTools, onDelta: () => undefined });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await run.cancel();
+  expect((await run.wait()).status).toBe("cancelled");
+  expect(calls).toHaveLength(1);
+});
+
+test("a rejected pending tool call fails the run instead of hanging it", async () => {
+  const { runtime } = runtimeWith(() =>
+    protoResponse([encodeConnectEnvelope(textFrame(toolCall("Bash", { command: "x" }))), endFrame()]),
+  );
+  const customTools = { Bash: { execute: () => Promise.reject(new Error("session closed")) } };
+  const run = await runtime.createAgent({ ...createInput, customTools }).send({ text: "go", customTools, onDelta: () => undefined });
+  const result = await run.wait();
+  expect(result.status).toBe("error");
+  expect(result.error?.message).toMatch(/tool execution was rejected: session closed/);
+});
+
 test("health descriptor advertises the transport and its capability envelope", () => {
   expect(inspectSandInference()).toEqual({
     ready: true,
@@ -268,6 +508,6 @@ test("health descriptor advertises the transport and its capability envelope", (
     patch_contract_version: "none",
     transport: "aiserver.v1.InferenceService/Stream",
     client_version: "sdk-1.0.30",
-    capabilities: { text: true, thinking: true, tools: false, images: false, cross_process_resume: false },
+    capabilities: { text: true, thinking: true, tools: true, images: false, cross_process_resume: false },
   });
 });

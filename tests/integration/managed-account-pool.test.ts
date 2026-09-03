@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { FakeClock } from "../../src/clock.js";
 import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 let ctx: TestContext | undefined;
@@ -113,6 +114,233 @@ test("pre-semantic provider failure retries once on another managed account", as
   expect(body.content.some((item) => item.text === "served-by-b")).toBe(true);
   expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-a", "cursor-b"]);
   expect(ctx.sdk.agents.map((agent) => agent.input.apiKey)).toEqual(["cursor-b"]);
+});
+
+const GROK_BOT_EXHAUSTED =
+  "[resource_exhausted] ERROR_GPT_4_VISION_PREVIEW_RATE_LIMIT: You've reached your Grok Bot usage limit: " +
+  "Your included Grok Bot usage limit has been reached. It resets in 7 days. Upgrade to get more usage.";
+
+async function listAccounts(context: TestContext) {
+  const response = await fetch(`${context.url}/v0/management/accounts`);
+  expect(response.status).toBe(200);
+  return ((await response.json()) as {
+    accounts: Array<{ id: string; enabled: boolean; state: string; cooldown_until?: number; cooldown_reason?: string }>;
+  }).accounts;
+}
+
+test("a quota-exhausted account is rested for the hinted reset window and the pool routes around it", async () => {
+  const clock = new FakeClock(1_700_000_000_000);
+  const stateDir = mkdtempSync(join(tmpdir(), "cursor-sdk2api-quota-cooldown-"));
+  ctx = await startTestApp({
+    clock,
+    captureLogs: true,
+    config: { authMode: "managed", gatewayAccessKey: "gateway-key", managedCursorKey: undefined, stateDir },
+    sdk: {
+      modelsByApiKey: {
+        "cursor-a": { ok: true, models: [{ id: "composer-2.5" }] },
+        "cursor-b": { ok: true, models: [{ id: "composer-2.5" }] },
+      },
+      createErrorsByApiKey: {
+        "cursor-a": { message: GROK_BOT_EXHAUSTED, name: "RateLimitError" },
+      },
+      agentScripts: [[[{ type: "text", chunks: ["served-by-b"] }]], [[{ type: "text", chunks: ["served-by-b-again"] }]]],
+    },
+  });
+  const accountA = await addAccount(ctx, "cursor-a");
+  const accountB = await addAccount(ctx, "cursor-b");
+
+  // Round robin lands on A first; the quota failure fails over to B within the same request.
+  const first = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("hello")),
+  });
+  expect(first.status).toBe(200);
+  expect(((await first.json()) as { content: Array<{ text?: string }> }).content[0]?.text).toBe("served-by-b");
+  expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-a", "cursor-b"]);
+
+  // A is now resting until the hinted reset (7 days) and says why.
+  const listed = await listAccounts(ctx);
+  const restingA = listed.find((account) => account.id === accountA)!;
+  expect(restingA.state).toBe("cooldown");
+  expect(restingA.enabled).toBe(true);
+  expect(restingA.cooldown_until).toBe(clock.now() + 7 * 24 * 60 * 60_000);
+  expect(restingA.cooldown_reason).toMatch(/Grok Bot usage limit/);
+  expect(listed.find((account) => account.id === accountB)?.state).toBe("active");
+  expect(ctx.logs.some((line) => line.includes("managed account rested after quota exhaustion"))).toBe(true);
+
+  // The next new session never touches A.
+  const second = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("hello again")),
+  });
+  expect(second.status).toBe(200);
+  expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-a", "cursor-b", "cursor-b"]);
+
+  // The cooldown survives a restart because it lives in the account file.
+  await closeTestApp(ctx);
+  ctx = await startTestApp({
+    clock,
+    config: { authMode: "managed", gatewayAccessKey: "gateway-key", managedCursorKey: undefined, stateDir },
+    sdk: {
+      modelsByApiKey: {
+        "cursor-a": { ok: true, models: [{ id: "composer-2.5" }] },
+        "cursor-b": { ok: true, models: [{ id: "composer-2.5" }] },
+      },
+      scripts: [[{ type: "text", chunks: ["after-restart"] }]],
+    },
+  });
+  expect((await listAccounts(ctx)).find((account) => account.id === accountA)?.state).toBe("cooldown");
+  const third = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("post restart")),
+  });
+  expect(third.status).toBe(200);
+  expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-b"]);
+
+  // Once the reset window has passed, A is eligible again.
+  clock.advance(7 * 24 * 60 * 60_000 + 1);
+  expect((await listAccounts(ctx)).find((account) => account.id === accountA)?.state).toBe("active");
+  const fourth = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("after reset")),
+  });
+  expect(fourth.status).toBe(200);
+  expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-b", "cursor-a"]);
+});
+
+test("when every enabled account is resting the client gets one clear 429 with the earliest reset", async () => {
+  const clock = new FakeClock(1_700_000_000_000);
+  ctx = await startTestApp({
+    clock,
+    config: { authMode: "managed", gatewayAccessKey: "gateway-key", managedCursorKey: undefined },
+    sdk: {
+      modelsByApiKey: { "cursor-a": { ok: true, models: [{ id: "composer-2.5" }] } },
+      createErrorsByApiKey: {
+        "cursor-a": { message: "You've reached your usage limit. It resets in 3 hours.", name: "RateLimitError" },
+      },
+    },
+  });
+  await addAccount(ctx, "cursor-a");
+
+  const exhausted = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("hello")),
+  });
+  expect(exhausted.status).toBe(429);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+
+  const blocked = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("hello again")),
+  });
+  expect(blocked.status).toBe(429);
+  const body = (await blocked.json()) as { error: { type: string; message: string } };
+  expect(body.error.type).toBe("rate_limited");
+  expect(body.error.message).toContain(new Date(clock.now() + 3 * 60 * 60_000).toISOString());
+  // No upstream call was made for the blocked request.
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+});
+
+test("transient rate limits fail over but do not rest the account", async () => {
+  ctx = await startTestApp({
+    config: { authMode: "managed", gatewayAccessKey: "gateway-key", managedCursorKey: undefined },
+    sdk: {
+      modelsByApiKey: {
+        "cursor-a": { ok: true, models: [{ id: "composer-2.5" }] },
+        "cursor-b": { ok: true, models: [{ id: "composer-2.5" }] },
+      },
+      createErrorsByApiKey: {
+        "cursor-a": { message: "[resource_exhausted] ERROR_RATE_LIMITED: slow down", name: "RateLimitError" },
+      },
+    },
+  });
+  const accountA = await addAccount(ctx, "cursor-a");
+  await addAccount(ctx, "cursor-b");
+  const response = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("hello")),
+  });
+  expect(response.status).toBe(200);
+  expect((await listAccounts(ctx)).find((account) => account.id === accountA)?.state).toBe("active");
+});
+
+test("operators can disable and re-enable an account; enabling also clears a cooldown", async () => {
+  const clock = new FakeClock(1_700_000_000_000);
+  ctx = await startTestApp({
+    clock,
+    config: { authMode: "managed", gatewayAccessKey: "gateway-key", managedCursorKey: undefined },
+    sdk: {
+      modelsByApiKey: {
+        "cursor-a": { ok: true, models: [{ id: "composer-2.5" }] },
+        "cursor-b": { ok: true, models: [{ id: "composer-2.5" }] },
+      },
+    },
+  });
+  const accountA = await addAccount(ctx, "cursor-a");
+  const accountB = await addAccount(ctx, "cursor-b");
+
+  const setEnabled = async (id: string, enabled: boolean) => {
+    const response = await fetch(`${ctx!.url}/v0/management/accounts/enabled`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, enabled }),
+    });
+    return { status: response.status, body: (await response.json()) as { account?: { enabled: boolean; state: string } } };
+  };
+
+  const disabled = await setEnabled(accountA, false);
+  expect(disabled.status).toBe(200);
+  expect(disabled.body.account).toMatchObject({ enabled: false, state: "disabled" });
+
+  for (let index = 0; index < 2; index += 1) {
+    const response = await api(ctx, "/v1/messages", {
+      apiKey: "gateway-key",
+      method: "POST",
+      body: JSON.stringify(messageBody(`hello ${index}`)),
+    });
+    expect(response.status).toBe(200);
+  }
+  expect(ctx.sdk.createCalls.map((call) => call.apiKey)).toEqual(["cursor-b", "cursor-b"]);
+
+  // Disabling the last eligible account makes the pool refuse new sessions clearly.
+  await setEnabled(accountB, false);
+  const refused = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("nobody home")),
+  });
+  expect(refused.status).toBe(503);
+  expect(await refused.text()).toContain("disabled by the operator");
+
+  // Re-enabling A also wipes any cooldown that was recorded meanwhile.
+  ctx.app.accounts.setCooldown(accountA, clock.now() + 60_000, "test cooldown");
+  expect((await listAccounts(ctx)).find((account) => account.id === accountA)?.state).toBe("disabled");
+  const enabled = await setEnabled(accountA, true);
+  expect(enabled.body.account).toMatchObject({ enabled: true, state: "active" });
+  expect((await listAccounts(ctx)).find((account) => account.id === accountA)?.cooldown_until).toBeUndefined();
+
+  const back = await api(ctx, "/v1/messages", {
+    apiKey: "gateway-key",
+    method: "POST",
+    body: JSON.stringify(messageBody("welcome back")),
+  });
+  expect(back.status).toBe(200);
+  expect(ctx.sdk.createCalls.at(-1)?.apiKey).toBe("cursor-a");
+
+  const invalid = await fetch(`${ctx.url}/v0/management/accounts/enabled`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: accountA, enabled: "yes" }),
+  });
+  expect(invalid.status).toBe(422);
+  expect(((await invalid.json()) as { error: { type: string } }).error.type).toBe("invalid_request");
 });
 
 test("managed model catalog returns the union from every configured account", async () => {

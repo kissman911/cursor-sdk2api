@@ -34,6 +34,8 @@ export interface GatewayConfig {
   ordinaryTurnCoordinator: boolean;
   toolBatchSettleMs: number;
   catalogCacheMs: number;
+  /** Rest a managed account this long after a quota-exhausted failure that carries no reset hint. */
+  accountQuotaCooldownMs: number;
   sweepIntervalMs: number;
   maxBodyBytes: number;
   emptyWorkspaceDir?: string;
@@ -143,6 +145,7 @@ export function loadConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfi
     ),
     toolBatchSettleMs: envInt("TOOL_BATCH_SETTLE_MS", 1_500),
     catalogCacheMs: envInt("CATALOG_CACHE_MS", 5 * 60_000),
+    accountQuotaCooldownMs: clamp(envInt("ACCOUNT_QUOTA_COOLDOWN_MS", 60 * 60_000), 10_000, 35 * 24 * 60 * 60_000),
     sweepIntervalMs: envInt("SWEEP_INTERVAL_MS", 5_000),
     maxBodyBytes: envInt("MAX_BODY_BYTES", 2 * 1024 * 1024),
     emptyWorkspaceDir: process.env.EMPTY_WORKSPACE_DIR || undefined,

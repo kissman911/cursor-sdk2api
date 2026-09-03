@@ -21,6 +21,12 @@ interface AccountFile {
   api_key: string;
   added_at: number;
   default_profile?: RuntimeProfile;
+  /** Operator switch. Absent means enabled. */
+  disabled?: boolean;
+  disabled_at?: number;
+  /** Quota cooldown: the pool skips this account for new sessions until this epoch ms. */
+  cooldown_until?: number;
+  cooldown_reason?: string;
 }
 
 export interface StoredCursorAccount {
@@ -29,6 +35,29 @@ export interface StoredCursorAccount {
   addedAt: number;
   keyHint: string;
   defaultProfile: RuntimeProfile;
+  enabled: boolean;
+  disabledAt?: number;
+  cooldownUntil?: number;
+  cooldownReason?: string;
+}
+
+export type AccountAvailability =
+  | { available: true }
+  | { available: false; reason: "disabled" }
+  | { available: false; reason: "cooldown"; until: number; detail?: string };
+
+/** Whether the pool may hand this account to a NEW session at `now`. */
+export function accountAvailability(account: StoredCursorAccount, now: number): AccountAvailability {
+  if (!account.enabled) return { available: false, reason: "disabled" };
+  if (typeof account.cooldownUntil === "number" && account.cooldownUntil > now) {
+    return {
+      available: false,
+      reason: "cooldown",
+      until: account.cooldownUntil,
+      ...(account.cooldownReason ? { detail: account.cooldownReason } : {}),
+    };
+  }
+  return { available: true };
 }
 
 const FILE_RE = /^acct_[A-Za-z0-9-]+\.json$/;
@@ -111,12 +140,50 @@ export class CursorAccountFileStore {
   }
 
   setDefaultProfile(id: string, profile: RuntimeProfile): StoredCursorAccount | undefined {
+    return this.update(id, (account) => ({ ...account, default_profile: profile }));
+  }
+
+  /** Enabling an account is an explicit operator decision, so it also clears any quota cooldown. */
+  setEnabled(id: string, enabled: boolean, now = Date.now()): StoredCursorAccount | undefined {
+    return this.update(id, (account) => {
+      const next: AccountFile = { ...account };
+      if (enabled) {
+        delete next.disabled;
+        delete next.disabled_at;
+        delete next.cooldown_until;
+        delete next.cooldown_reason;
+      } else {
+        next.disabled = true;
+        next.disabled_at = account.disabled_at ?? now;
+      }
+      return next;
+    });
+  }
+
+  setCooldown(id: string, until: number, reason: string): StoredCursorAccount | undefined {
+    return this.update(id, (account) => ({
+      ...account,
+      cooldown_until: until,
+      cooldown_reason: reason.slice(0, 300),
+    }));
+  }
+
+  clearCooldown(id: string): StoredCursorAccount | undefined {
+    return this.update(id, (account) => {
+      const next: AccountFile = { ...account };
+      delete next.cooldown_until;
+      delete next.cooldown_reason;
+      return next;
+    });
+  }
+
+  private update(id: string, mutate: (account: AccountFile) => AccountFile): StoredCursorAccount | undefined {
     const name = `${id}.json`;
     if (!FILE_RE.test(name)) return undefined;
     const path = join(this.dir, name);
     const account = this.read(path);
     if (!account) return undefined;
-    const next: AccountFile = { ...account, default_profile: profile };
+    const next = mutate(account);
     this.write(next);
     return this.toPublic(next);
   }
@@ -170,6 +237,12 @@ export class CursorAccountFileStore {
       addedAt: account.added_at,
       keyHint: keyHint(account.api_key),
       defaultProfile: readStoredProfile(account.default_profile),
+      enabled: account.disabled !== true,
+      ...(typeof account.disabled_at === "number" ? { disabledAt: account.disabled_at } : {}),
+      ...(typeof account.cooldown_until === "number" ? { cooldownUntil: account.cooldown_until } : {}),
+      ...(typeof account.cooldown_reason === "string" && account.cooldown_reason
+        ? { cooldownReason: account.cooldown_reason }
+        : {}),
     };
   }
 }

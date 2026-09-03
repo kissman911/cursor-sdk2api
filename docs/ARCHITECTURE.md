@@ -50,14 +50,30 @@ writer are unchanged:
   `x-sand-box-namespace: prod`, `x-ghost-mode: true`. Bare desktop versions are
   rejected as ERROR_OUTDATED_CLIENT.
 - Semantics: text and thinking deltas flow through `onDelta` exactly like the
-  SDK path. The transport has no tool calls: client tool catalogs are still
-  rendered into the prompt, but the model cannot invoke them. Images are dropped.
+  SDK path. Images are dropped.
+- Tools: the wire has no tool calls, so `SandInferenceRuntime` carries them in
+  the prompt (`src/sdk/sand-tool-protocol.ts`). When `send()` receives
+  `customTools`, a system message (role 4) with the catalog and an explicit
+  `<sand:tool_call>{"name","input"}</sand:tool_call>` contract is prepended to
+  every round trip (never stored in history). Streamed text passes through
+  `SandToolCallScanner`, which forwards prose and captures tagged blocks even
+  across chunk boundaries. When the upstream stream ends, every parsed call is
+  handed to `customTool.execute` synchronously, so ToolBridge/EventPump see one
+  batch and the client gets `tool_use` blocks with `stop_reason: tool_use`. The
+  run then awaits the coordinator-resolved results, appends the raw assistant
+  text plus a user message of `<sand:tool_result id name is_error>` blocks, and
+  opens the next InferenceService request; the loop ends when a step has no
+  calls. Steps with only malformed blocks are re-prompted with the parse error
+  up to `SAND_MAX_MALFORMED_RETRIES` times, then surfaced as text. `cancel()`
+  aborts an in-flight request or a pending tool wait.
 - State: a Sand Agent is an in-memory message history keyed by agent id and
-  credential. Exact live successors reuse it via `send()`; after a process
-  restart `Agent.resume` is refused and the coordinator's existing full-transcript
-  cold rebuild takes over. Nothing is written to the SDK store.
+  credential (user turn, assistant text with tags, tool-result user message,
+  ..., final assistant text). Exact live successors reuse it via `send()`;
+  after a process restart `Agent.resume` is refused and the coordinator's
+  existing full-transcript cold rebuild takes over. Nothing is written to the
+  SDK store.
 - Health: `/health.profiles.sand` reports `transport`, `client_version`, and a
-  `capabilities` envelope (`tools: false`, `images: false`,
+  `capabilities` envelope (`tools: true`, `images: false`,
   `cross_process_resume: false`). The hash-guarded SDK clone
   (`sand-loader.ts`) is no longer on the request path.
 

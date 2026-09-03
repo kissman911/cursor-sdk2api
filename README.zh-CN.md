@@ -33,7 +33,7 @@
 - **一把网关 Key，多账号共用：** Cursor 账号池持久化、按模型 round-robin、SDK 陈旧登录态恢复、语义输出前账号故障转移、Dashboard 额度、Web 控制台和 Docker。
 - **续轮冷恢复：** 客户端携带完整 transcript 时，可以重建过期或迁移的工具轮；已经执行过的同一工具由网关内部回放结果，不重复产生副作用。
 - **已集成 new-api：** 已提供外置部署、渠道模板、compose E2E 和验收 smoke。[直接查看 new-api 接入指南](docs/NEW_API_INTEGRATION.md)。
-- **运行方式：** 默认 `sdk`。显式 `sand` 消耗账号的 **Grok Bot 周额度**：走 `aiserver.v1.InferenceService/Stream` 直连传输（Cursor 在 SDK 的 Agent 端点上拒绝 Sand 流量），要求 Grok Bot 授权，且**仅支持文本与 thinking**——模型无法调用客户端工具、忽略图片、Agent 仅驻留进程内（重启后按完整 transcript 冷重建）。不会在 `sdk` 与 `sand` 之间静默互退。
+- **运行方式：** 默认 `sdk`。显式 `sand` 消耗账号的 **Grok Bot 周额度**：走 `aiserver.v1.InferenceService/Stream` 直连传输（Cursor 在 SDK 的 Agent 端点上拒绝 Sand 流量），要求 Grok Bot 授权。支持文本、thinking 与客户端工具（工具通过 prompt 协议承载，对客户端表现为标准的 `tool_use` / `tool_result` 往返，Claude Code 的 Bash/Read/Edit 循环可正常运行）；忽略图片，Agent 仅驻留进程内（重启后按完整 transcript 冷重建）。不会在 `sdk` 与 `sand` 之间静默互退。
 - **耐久 Run：** 可选 SQLite 账本（`RUNTIME_LEDGER_V2=1`）保证同一逻辑请求只 Send 一次，断线后继续观察到终态并写出一条 receipt。
 - **Responses Compact：** `POST /v1/responses/compact` 返回唯一网关本地 `csgw1.` compaction item，不第二次 Cursor Send。
 
@@ -121,6 +121,8 @@ env_key = "GATEWAY_ACCESS_KEY"
 - `STATE_DIR`：账号、SDK store 和 resume 状态
 
 Managed 模式沿用 CPA 的客户端 Key 与上游凭据分离方式：客户端只拿到 `GATEWAY_ACCESS_KEY`，导入的 Cursor Key 留在网关账号池。新会话按模型 round-robin；正常续轮固定原账号，尚未产生语义输出时允许一次备用账号重试。原账号或 SDK 会话丢失时，只要 transcript 完整且自洽，网关可安全冷恢复。BYOK 仅作为可信单用户 sidecar 的兼容模式保留。
+
+额度用尽的账号会自动"休息"：遇到额度耗尽类错误（Grok Bot 周额度、Cursor 用量上限）时，网关按 Cursor 消息里的重置时间（没有则按 `ACCOUNT_QUOTA_COOLDOWN_MS`，默认 1 小时）持久化记录冷却期，在此期间新会话不再选中该账号；重启后依然有效。运营者也可以在控制台或通过 `PUT /v0/management/accounts/enabled {"id","enabled"}` 手动停用/启用账号，启用会同时清除冷却。所有已启用账号都在休息时，客户端会收到一条明确的 `429 rate_limited`，并注明最早的恢复时间。
 
 `v0.1` 是可信单进程 sidecar。账号管理接口没有单独认证；导入的 Cursor Key 会保存在仅 Owner 可读的状态文件中，导入后不会再返回给浏览器。随附 compose 已把控制台绑定到本机回环；任何公网反代都必须认证并限制 `/console/` 与 `/v0/management/*`。
 

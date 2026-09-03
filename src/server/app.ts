@@ -7,9 +7,14 @@ import {
   type AuthContext,
   type ClientAuthorization,
 } from "../auth/credentials.js";
+import { classifyQuotaExhaustion } from "../auth/quota-cooldown.js";
 import { fetchCursorSandQuota } from "../account/cursor-dashboard.js";
 import { readAccount } from "../account/service.js";
-import { CursorAccountFileStore, type StoredCursorAccount } from "../account/file-store.js";
+import {
+  accountAvailability,
+  CursorAccountFileStore,
+  type StoredCursorAccount,
+} from "../account/file-store.js";
 import {
   DEFAULT_RUNTIME_PROFILE,
   resolveRequestProfile,
@@ -192,12 +197,43 @@ export function createApp(input: {
       defaultProfile: defaultProfile ?? config.runtimePolicy.defaultProfile ?? DEFAULT_RUNTIME_PROFILE,
       sandLoaderReady: sandHealth.ready,
     });
-  const publicAccount = (account: StoredCursorAccount) => ({
-    id: account.id,
-    key_hint: account.keyHint,
-    added_at: account.addedAt,
-    default_profile: account.defaultProfile,
-  });
+  const publicAccount = (account: StoredCursorAccount) => {
+    const availability = accountAvailability(account, clock.now());
+    return {
+      id: account.id,
+      key_hint: account.keyHint,
+      added_at: account.addedAt,
+      default_profile: account.defaultProfile,
+      enabled: account.enabled,
+      state: availability.available ? "active" : availability.reason,
+      ...(account.disabledAt ? { disabled_at: account.disabledAt } : {}),
+      ...(account.cooldownUntil ? { cooldown_until: account.cooldownUntil } : {}),
+      ...(account.cooldownReason ? { cooldown_reason: account.cooldownReason } : {}),
+    };
+  };
+
+  /**
+   * Remember that an account has no quota left so new sessions stop landing on
+   * it. Bound sessions keep their account; only pool selection changes.
+   */
+  const restAccountAfterQuotaFailure = (auth: AuthContext, error: unknown): void => {
+    if (auth.mode !== "managed") return;
+    const exhaustion = classifyQuotaExhaustion(error, config.accountQuotaCooldownMs);
+    if (!exhaustion) return;
+    const account = accounts.findByFingerprint(auth.fingerprint);
+    if (!account) return;
+    const until = clock.now() + exhaustion.cooldownMs;
+    accounts.setCooldown(account.id, until, exhaustion.reason);
+    logger.warn(
+      {
+        account_id: account.id,
+        cooldown_until: new Date(until).toISOString(),
+        cooldown_ms: exhaustion.cooldownMs,
+        reset_hint: exhaustion.fromHint,
+      },
+      "managed account rested after quota exhaustion",
+    );
+  };
 
   const boundCredentialFingerprint = (parsed: ParsedMessages, sessionHint?: string): string | undefined => {
     if (parsed.continuation) {
@@ -230,9 +266,24 @@ export function createApp(input: {
       }
     }
 
-    const configured = accounts.list();
-    if (configured.length === 0) {
+    const stored = accounts.list();
+    if (stored.length === 0) {
       throw upstreamError("No Cursor accounts are configured in the gateway pool", 503);
+    }
+    const now = clock.now();
+    const configured = stored.filter((account) => accountAvailability(account, now).available);
+    if (configured.length === 0) {
+      const resting = stored
+        .map((account) => accountAvailability(account, now))
+        .filter((availability): availability is Extract<typeof availability, { reason: "cooldown" }> =>
+          !availability.available && availability.reason === "cooldown");
+      if (resting.length === 0) {
+        throw upstreamError("Every Cursor account in the gateway pool is disabled by the operator", 503);
+      }
+      const earliest = new Date(Math.min(...resting.map((availability) => availability.until))).toISOString();
+      throw rateLimited(
+        `Every enabled Cursor account has exhausted its quota; the earliest one becomes available again at ${earliest}`,
+      );
     }
     let candidates = configured;
     if (parsed) {
@@ -305,6 +356,7 @@ export function createApp(input: {
       return;
     } catch (initialError) {
       let error = initialError;
+      restAccountAfterQuotaFailure(first, error);
       if (!responseStarted(res) && staleCredentialSessionError(error)) {
         const probe = await probeCredential(first);
         if (probe === "valid") {
@@ -337,7 +389,12 @@ export function createApp(input: {
         { model: parsed.model, error_type: error instanceof GatewayError ? error.code : "cursor_upstream_error" },
         "retrying pre-semantic Cursor request on another managed account",
       );
-      await run(alternate);
+      try {
+        await run(alternate);
+      } catch (alternateError) {
+        restAccountAfterQuotaFailure(alternate, alternateError);
+        throw alternateError;
+      }
     }
   };
 
@@ -536,6 +593,24 @@ export function createApp(input: {
         return;
       }
 
+      if (path === "/v0/management/accounts/enabled" && method === "PUT") {
+        const body = await readJsonBody(req, config.maxBodyBytes) as {
+          id?: unknown;
+          enabled?: unknown;
+        } | undefined;
+        const id = typeof body?.id === "string" ? body.id.trim() : "";
+        if (!id) throw invalidRequest("id is required");
+        if (typeof body?.enabled !== "boolean") throw invalidRequest("enabled must be a boolean");
+        const updated = accounts.setEnabled(id, body.enabled, clock.now());
+        if (!updated) throw notFound("Persistent account was not found");
+        logger.info(
+          { account_id: updated.id, enabled: updated.enabled },
+          updated.enabled ? "managed account enabled by operator" : "managed account disabled by operator",
+        );
+        sendJson(res, 200, { account: publicAccount(updated) }, requestId);
+        return;
+      }
+
       if (path === "/v0/management/accounts") {
         if (method === "GET") {
           sendJson(
@@ -610,11 +685,17 @@ export function createApp(input: {
         } else {
           const configured = accounts.list();
           const details = await Promise.all(
-            configured.map(async (account) => ({
-              id: account.id,
-              key_hint: account.keyHint,
-              account: await accountPayload(account.apiKey, account.defaultProfile),
-            })),
+            configured.map(async (account) => {
+              const summary = publicAccount(account);
+              return {
+                id: account.id,
+                key_hint: account.keyHint,
+                enabled: summary.enabled,
+                state: summary.state,
+                ...(summary.cooldown_until ? { cooldown_until: summary.cooldown_until } : {}),
+                account: await accountPayload(account.apiKey, account.defaultProfile),
+              };
+            }),
           );
           sendJson(res, 200, { pool: true, account_count: details.length, accounts: details }, requestId);
         }

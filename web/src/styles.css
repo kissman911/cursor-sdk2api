@@ -607,6 +607,8 @@ html[lang="zh-CN"] .page-head h1 { letter-spacing: 0; }
 }
 .row-link { display: grid; gap: 2px; text-decoration: none; }
 .quota-breakdown { display: block; margin-top: 4px; white-space: normal; }
+.pool-state { margin-top: 6px; }
+.grid-table tr.row-muted td:not(.row-actions) { opacity: 0.62; }
 .grid-table th:last-child,
 .grid-table td.row-actions { width: 1%; text-align: right; padding-right: 8px; }
 .grid-table td.row-actions { vertical-align: middle; white-space: nowrap; }

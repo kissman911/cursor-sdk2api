@@ -104,7 +104,7 @@ test("health reports runtime capability truth without account data", async () =>
   expect(profiles?.sand?.capabilities).toEqual({
     text: true,
     thinking: true,
-    tools: false,
+    tools: true,
     images: false,
     cross_process_resume: false,
   });

@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { addManagedAccount, getHealth, getManagedAccounts, probeManagedAccount, removeManagedAccount, runPrompt, setManagedDefaultProfile } from "./api";
+import {
+  addManagedAccount,
+  getHealth,
+  getManagedAccounts,
+  probeManagedAccount,
+  removeManagedAccount,
+  runPrompt,
+  setManagedAccountEnabled,
+  setManagedDefaultProfile,
+} from "./api";
 import { go, hrefFor, readRoute, type Route } from "./nav";
 import { RailNav } from "./RailNav";
 import { AccountDetailPage } from "./pages/AccountDetailPage";
@@ -12,7 +21,7 @@ import { QuotaPage } from "./pages/QuotaPage";
 import { BFTheme } from "./bflabs/BFTheme";
 import { Button } from "./bflabs/Button";
 import { StatusTag } from "./bflabs/StatusTag";
-import type { RosterItem } from "./roster";
+import { poolStateOf, type RosterItem } from "./roster";
 import type { HealthPayload, Protocol } from "./types";
 import bfMarkUrl from "./assets/bf-mark.svg";
 
@@ -135,6 +144,11 @@ const COPY = {
       keyPlaceholder: "Cursor API key",
       keyHelp: "Stored by the gateway in STATE_DIR/auths with owner-only file permissions.",
       remove: "Remove",
+      poolHelp: "Accounts that run out of quota rest automatically until Cursor's reset time; disabled or resting accounts are skipped for new sessions ({n} currently out of rotation).",
+      stateDisabled: "Disabled",
+      stateCooldown: "Quota exhausted · back {time}",
+      enable: "Enable",
+      disable: "Disable",
     },
     detail: {
       missing: "Account not found",
@@ -309,6 +323,11 @@ const COPY = {
       keyPlaceholder: "Cursor API Key",
       keyHelp: "账号由网关写入 STATE_DIR/auths，并使用仅属主可读写的文件权限。",
       remove: "移除",
+      poolHelp: "额度用尽的账号会自动休息到 Cursor 的重置时间；已停用或休息中的账号不会再被新会话选中（当前 {n} 个未参与轮询）。",
+      stateDisabled: "已停用",
+      stateCooldown: "额度已用尽 · {time} 恢复",
+      enable: "启用",
+      disable: "停用",
     },
     detail: {
       missing: "找不到这个账号",
@@ -474,6 +493,7 @@ export function App() {
         keyHint: account.key_hint,
         addedAt: account.added_at,
         testState: "idle",
+        ...poolStateOf(account),
       }));
       setRoster(next);
       setActiveId((current) => next.some((item) => item.id === current) ? current : next[0]?.id ?? "");
@@ -530,7 +550,13 @@ export function App() {
     setAddError("");
     try {
       const account = await addManagedAccount(key);
-      const next: RosterItem = { id: account.id, keyHint: account.key_hint, addedAt: account.added_at, testState: "testing" };
+      const next: RosterItem = {
+        id: account.id,
+        keyHint: account.key_hint,
+        addedAt: account.added_at,
+        testState: "testing",
+        ...poolStateOf(account),
+      };
       setRoster((current) => current.some((item) => item.id === next.id) ? current : [...current, next]);
       setActiveId(next.id);
       setDraftKey("");
@@ -558,6 +584,16 @@ export function App() {
       return next;
     });
     if (route.accountId === id) go("accounts");
+  };
+
+  const toggleAccountEnabled = async (id: string, enabled: boolean) => {
+    setAddError("");
+    try {
+      const account = await setManagedAccountEnabled(id, enabled);
+      patchRoster(id, poolStateOf(account));
+    } catch (error) {
+      setAddError(messageOf(error));
+    }
   };
 
   const setAccountProfile = async (id: string, profile: "sdk" | "sand") => {
@@ -601,7 +637,25 @@ export function App() {
   };
 
   const healthOk = health?.status === "ok";
-  const homeCopy = t.home as unknown as HomeCopy & { add: string; adding: string; keyPlaceholder: string; keyHelp: string; remove: string };
+  const homeCopy = t.home as unknown as HomeCopy & {
+    add: string;
+    adding: string;
+    keyPlaceholder: string;
+    keyHelp: string;
+    remove: string;
+    poolHelp: string;
+    stateDisabled: string;
+    stateCooldown: string;
+    enable: string;
+    disable: string;
+  };
+  const poolStateCopy = {
+    stateDisabled: homeCopy.stateDisabled,
+    stateCooldown: homeCopy.stateCooldown,
+    enable: homeCopy.enable,
+    disable: homeCopy.disable,
+    locale: language === "zh" ? "zh-CN" : "en-US",
+  };
 
   const pageLabel = pageLabelFor(route.page, t);
 
@@ -682,6 +736,7 @@ export function App() {
         {route.page === "accounts" ? (
           <AccountsPage
             t={homeCopy}
+            poolState={poolStateCopy}
             draftKey={draftKey}
             addError={addError}
             adding={adding}
@@ -690,6 +745,7 @@ export function App() {
             onAdd={() => void addAccount()}
             onTest={(id) => void testAccount(id)}
             onRemove={(id) => void removeAccount(id)}
+            onToggleEnabled={(id, enabled) => void toggleAccountEnabled(id, enabled)}
           />
         ) : null}
         {route.page === "account" ? (

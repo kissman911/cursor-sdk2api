@@ -1,10 +1,17 @@
 import type { AccountPayload, HealthPayload, ModelsPayload, Protocol } from "./types.js";
 
+export type ManagementAccountState = "active" | "disabled" | "cooldown";
+
 export interface ManagementAccount {
   id: string;
   key_hint: string;
   added_at: number;
   default_profile?: "sdk" | "sand";
+  enabled?: boolean;
+  state?: ManagementAccountState;
+  disabled_at?: number;
+  cooldown_until?: number;
+  cooldown_reason?: string;
 }
 
 export async function getHealth(): Promise<HealthPayload> {
@@ -51,6 +58,16 @@ export async function setManagedDefaultProfile(
     path: "/default_profile",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ id, default_profile: defaultProfile }),
+  });
+  return body.account;
+}
+
+export async function setManagedAccountEnabled(id: string, enabled: boolean): Promise<ManagementAccount> {
+  const body = await managementJson<{ account: ManagementAccount }>({
+    method: "PUT",
+    path: "/enabled",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id, enabled }),
   });
   return body.account;
 }
