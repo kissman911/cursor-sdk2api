@@ -38,6 +38,31 @@ export function fromSdkUsage(usage: SdkUsage | undefined): UsageView {
   return view;
 }
 
+/**
+ * Usage attributable to one response segment: the cumulative run usage minus
+ * what earlier segments already reported. Counters never go backwards in
+ * either runtime, but clamp at zero so an inconsistent snapshot can never
+ * produce negative billing.
+ */
+export function segmentUsage(cumulative: SdkUsage, reported: SdkUsage | undefined): UsageView {
+  const diff = (current: number | undefined, previous: number | undefined): number | undefined => {
+    if (typeof current !== "number") return undefined;
+    return Math.max(0, current - (previous ?? 0));
+  };
+  const view: UsageView = {
+    input_tokens: diff(cumulative.inputTokens, reported?.inputTokens) ?? 0,
+    output_tokens: diff(cumulative.outputTokens, reported?.outputTokens) ?? 0,
+    usage_status: "sdk",
+  };
+  const cacheWrite = diff(cumulative.cacheWriteTokens, reported?.cacheWriteTokens);
+  if (cacheWrite !== undefined) view.cache_creation_input_tokens = cacheWrite;
+  const cacheRead = diff(cumulative.cacheReadTokens, reported?.cacheReadTokens);
+  if (cacheRead !== undefined) view.cache_read_input_tokens = cacheRead;
+  const reasoning = diff(cumulative.reasoningTokens, reported?.reasoningTokens);
+  if (reasoning !== undefined) view.reasoning_tokens = reasoning;
+  return view;
+}
+
 /** Map protocol usage to ledger token ints. Deferred usage is omitted, never invented. */
 export function toLedgerUsage(usage: UsageView | undefined): LedgerUsage | undefined {
   if (!usage) return undefined;

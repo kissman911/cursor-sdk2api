@@ -1,14 +1,15 @@
 import type { Clock } from "../clock.js";
 import { emptyTurn, sdkFailure, timeoutError, upstreamError } from "../errors.js";
 import { messageId } from "../ids.js";
-import type { AnthropicContentBlock, AssistantTurn } from "../protocols/anthropic/types.js";
-import type { SdkDeltaUpdate, SdkRun, SdkStreamEvent } from "../sdk/port.js";
-import { deferredUsage, fromSdkUsage } from "./usage.js";
+import type { AnthropicContentBlock, AssistantTurn, UsageView } from "../protocols/anthropic/types.js";
+import type { SdkDeltaUpdate, SdkRun, SdkStreamEvent, SdkUsage } from "../sdk/port.js";
+import { deferredUsage, fromSdkUsage, segmentUsage } from "./usage.js";
 import type { PendingCall, Session } from "./session.js";
 
 export type PumpBoundary =
   | { type: "tools"; turn: AssistantTurn }
-  | { type: "final"; turn: AssistantTurn }
+  /** `totalUsage` is the run-wide cumulative usage; `turn.usage` only covers this response segment. */
+  | { type: "final"; turn: AssistantTurn; totalUsage?: UsageView }
   | { type: "error"; error: unknown };
 
 export type DeltaRecord = { kind: "text" | "thinking"; text: string };
@@ -37,6 +38,13 @@ export class EventPump {
   /** Once official onDelta is seen, ignore stream assistant/thinking snapshots. */
   private preferOnDelta = false;
   private segmentMessageId = messageId();
+  /**
+   * Cumulative SDK usage already attributed to earlier response segments of
+   * this run. Each HTTP response reports only the increment since the previous
+   * boundary so that billing gateways see per-request usage that still sums to
+   * the run total.
+   */
+  private reportedUsage: SdkUsage | undefined;
 
   constructor(
     private readonly session: Session,
@@ -185,6 +193,7 @@ export class EventPump {
         return;
       }
       this.session.hasSemanticOutput = true;
+      const cumulative = result.usage ?? this.run.usage;
       this.publish({
         type: "final",
         turn: {
@@ -193,8 +202,9 @@ export class EventPump {
           model: this.session.modelId,
           stopReason: "end_turn",
           blocks,
-          usage: fromSdkUsage(result.usage),
+          usage: this.takeSegmentUsage(cumulative) ?? fromSdkUsage(undefined),
         },
+        totalUsage: fromSdkUsage(cumulative),
       });
     } catch (error) {
       this.fail(sdkFailure(error));
@@ -242,6 +252,10 @@ export class EventPump {
         ...(call.namespace ? { namespace: call.namespace } : {}),
       });
     }
+    // Both runtimes keep `run.usage` cumulative and already include the model
+    // step that produced this tool batch, so the segment increment is known now.
+    // When the runtime has not reported anything yet, stay deferred and let the
+    // final segment carry the remainder instead of inventing numbers.
     this.publish({
       type: "tools",
       turn: {
@@ -250,9 +264,17 @@ export class EventPump {
         model: this.session.modelId,
         stopReason: "tool_use",
         blocks,
-        usage: deferredUsage(),
+        usage: this.takeSegmentUsage(this.run.usage) ?? deferredUsage(),
       },
     });
+  }
+
+  /** Attribute the increment since the last boundary to the current segment. */
+  private takeSegmentUsage(cumulative: SdkUsage | undefined): UsageView | undefined {
+    if (!cumulative) return undefined;
+    const increment = segmentUsage(cumulative, this.reportedUsage);
+    this.reportedUsage = { ...cumulative };
+    return increment;
   }
 
   private fail(error: unknown): void {

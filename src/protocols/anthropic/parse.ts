@@ -246,21 +246,40 @@ function parseSystem(value: unknown): string {
   throw invalidRequest("system must be a string or text block array");
 }
 
+/**
+ * Marker under which text that shares a user turn with tool_result blocks is
+ * delivered to the model. Claude Code routinely appends `<system-reminder>`
+ * blocks or queued user input to the same turn as its tool results; the SDK
+ * only accepts tool results while a run is awaiting them, so the text rides
+ * along with the last result instead of failing the whole continuation.
+ */
+export const ATTACHED_CONTINUATION_TEXT_MARKER = "[Additional user message delivered with these tool results]";
+
 export function parseContinuation(lastUser: AnthropicMessage): ParsedToolResult[] | undefined {
   const blocks = asBlocks(lastUser.content);
-  const hasToolResult = blocks.some((block) => block.type === "tool_result");
-  if (!hasToolResult) return undefined;
-  const mixed = blocks.some((block) => block.type !== "tool_result");
-  if (mixed) {
-    throw invalidRequest("mixed new text and tool_result in the latest user turn is not allowed");
+  const toolResults = blocks.filter(
+    (block): block is Extract<AnthropicContentBlock, { type: "tool_result" }> => block.type === "tool_result",
+  );
+  if (toolResults.length === 0) return undefined;
+  const unsupported = blocks.find((block) => block.type !== "tool_result" && block.type !== "text" && block.type !== "image");
+  if (unsupported) {
+    throw invalidRequest(`${unsupported.type} blocks cannot share a user turn with tool_result`);
   }
-  return blocks
-    .filter((block): block is Extract<AnthropicContentBlock, { type: "tool_result" }> => block.type === "tool_result")
-    .map((block) => ({
-      toolUseId: block.tool_use_id,
-      content: stringifyToolResult(block.content),
-      isError: block.is_error === true,
-    }));
+  const results = toolResults.map((block) => ({
+    toolUseId: block.tool_use_id,
+    content: stringifyToolResult(block.content),
+    isError: block.is_error === true,
+  }));
+  const attachedText = blocks
+    .filter((block): block is Extract<AnthropicContentBlock, { type: "text" }> => block.type === "text")
+    .map((block) => block.text.trim())
+    .filter(Boolean)
+    .join("\n\n");
+  if (attachedText) {
+    const last = results[results.length - 1]!;
+    last.content = `${last.content}\n\n${ATTACHED_CONTINUATION_TEXT_MARKER}\n${attachedText}`;
+  }
+  return results;
 }
 
 export function asBlocks(content: string | AnthropicContentBlock[]): AnthropicContentBlock[] {

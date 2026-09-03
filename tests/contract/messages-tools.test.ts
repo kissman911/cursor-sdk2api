@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "vitest";
+import { ATTACHED_CONTINUATION_TEXT_MARKER } from "../../src/protocols/anthropic/parse.js";
 import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 let ctx: TestContext;
@@ -349,7 +350,53 @@ test("successful tool_result still resolves as a plain string", async () => {
   expect(ctx.sdk.agents[0]?.runs[0]?.capturedToolResults).toEqual(["72F"]);
 });
 
-test("mixed new text and tool_result is rejected", async () => {
+test("text sharing a user turn with tool_result rides along with the last result", async () => {
+  ctx = await startTestApp({
+    sdk: {
+      scripts: [
+        [
+          { type: "tools", calls: [{ name: "lookup", input: { q: "ok" } }] },
+          { type: "text", chunks: ["done"] },
+        ],
+      ],
+    },
+  });
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "go" }],
+      tools: [weatherTool()],
+    }),
+  });
+  const turn = (await first.json()) as { content: Array<{ type: string; id?: string }> };
+  const id = turn.content.find((block) => block.type === "tool_use")?.id;
+  const second = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: id, content: "72F" },
+            { type: "text", text: "<system-reminder>also do this</system-reminder>" },
+          ],
+        },
+      ],
+    }),
+  });
+  expect(second.status).toBe(200);
+  const delivered = ctx.sdk.agents[0]?.runs[0]?.capturedToolResults as string[];
+  expect(delivered).toHaveLength(1);
+  expect(delivered[0]).toContain("72F");
+  expect(delivered[0]).toContain(ATTACHED_CONTINUATION_TEXT_MARKER);
+  expect(delivered[0]).toContain("<system-reminder>also do this</system-reminder>");
+});
+
+test("non-text blocks other than images cannot share a user turn with tool_result", async () => {
   ctx = await startTestApp();
   const res = await api(ctx, "/v1/messages", {
     method: "POST",
@@ -360,7 +407,7 @@ test("mixed new text and tool_result is rejected", async () => {
         {
           role: "user",
           content: [
-            { type: "text", text: "also do this" },
+            { type: "tool_use", id: "toolu_y", name: "lookup", input: {} },
             { type: "tool_result", tool_use_id: "toolu_x", content: "1" },
           ],
         },

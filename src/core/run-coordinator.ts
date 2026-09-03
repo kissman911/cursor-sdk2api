@@ -1472,7 +1472,9 @@ export class RunCoordinator {
       }
       if (boundary.type === "final") {
         ledger.persistObserveOffset(runId, boundary.turn.messageId, generation);
-        const usage = toLedgerUsage(boundary.turn.usage) ?? { inputTokens: 0, outputTokens: 0 };
+        // The receipt covers the whole run, not just the last response segment.
+        const usage =
+          toLedgerUsage(boundary.totalUsage ?? boundary.turn.usage) ?? { inputTokens: 0, outputTokens: 0 };
         ledger.finalizeRunWithReceipt({
           runId,
           generation,
