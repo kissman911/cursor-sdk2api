@@ -40,13 +40,30 @@ export async function getManagedAccounts(): Promise<ManagementAccount[]> {
   return body.accounts;
 }
 
-export async function addManagedAccount(apiKey: string): Promise<ManagementAccount> {
-  const body = await managementJson<{ account: ManagementAccount }>({
+export interface AddManagedAccountResult {
+  account: ManagementAccount;
+  /** True when a session token was exchanged for a freshly minted Cursor API key. */
+  minted_api_key?: boolean;
+  email?: string;
+}
+
+/**
+ * A `WorkosCursorSessionToken` cookie value (`user_<id>::<jwt>`, possibly
+ * URL-encoded) or a bare JWT. The gateway exchanges it once for a User API Key
+ * and never stores the token itself.
+ */
+export function looksLikeSessionToken(value: string): boolean {
+  const trimmed = value.trim().replace(/^WorkosCursorSessionToken=/i, "");
+  if (/^user_[A-Za-z0-9]+(::|%3A%3A)/i.test(trimmed)) return true;
+  return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(trimmed);
+}
+
+export async function addManagedAccount(secret: string): Promise<AddManagedAccountResult> {
+  return managementJson<AddManagedAccountResult>({
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ api_key: apiKey }),
+    body: JSON.stringify(looksLikeSessionToken(secret) ? { session_token: secret } : { api_key: secret }),
   });
-  return body.account;
 }
 
 export async function setManagedDefaultProfile(

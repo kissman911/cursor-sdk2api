@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UNAVAILABLE_GROK_BOT } from "../../src/account/service.js";
 import type { CursorSandResult } from "../../src/account/cursor-dashboard.js";
+import type { MintUserApiKeyResult } from "../../src/account/session-token.js";
 import { SystemClock, type Clock } from "../../src/clock.js";
 import { loadConfig, type GatewayConfig } from "../../src/config.js";
 import { createLogger } from "../../src/log.js";
@@ -31,6 +32,7 @@ export async function startTestApp(
     fetchSandQuota?: (apiKey: string) => Promise<CursorSandResult>;
     sandHealth?: import("../../src/sdk/sand-loader.js").SandLoaderHealth;
     assertSandAccess?: (apiKey: string) => Promise<void>;
+    mintApiKeyFromSessionToken?: (token: string) => Promise<MintUserApiKeyResult>;
   } = {},
 ): Promise<TestContext> {
   const clock = options.clock ?? new SystemClock();
@@ -67,6 +69,12 @@ export async function startTestApp(
     fetchSandQuota: options.fetchSandQuota ?? (async () => UNAVAILABLE_GROK_BOT),
     sandHealth: options.sandHealth ?? inspectSandInference(),
     assertSandAccess: options.assertSandAccess,
+    // Contract tests never reach Cursor; an unmocked mint call is a test bug.
+    mintApiKeyFromSessionToken:
+      options.mintApiKeyFromSessionToken ??
+      (async () => {
+        throw new Error("mintApiKeyFromSessionToken was not mocked in this test");
+      }),
   });
   const server = createServer((req, res) => {
     void app.handler(req, res);

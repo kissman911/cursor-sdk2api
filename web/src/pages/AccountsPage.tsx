@@ -9,6 +9,7 @@ export function AccountsPage({
   poolState,
   draftKey,
   addError,
+  addNotice,
   adding,
   roster,
   onDraft,
@@ -21,6 +22,7 @@ export function AccountsPage({
   poolState: PoolStateCopy;
   draftKey: string;
   addError: string;
+  addNotice: string;
   adding: boolean;
   roster: RosterItem[];
   onDraft: (value: string) => void;
@@ -62,6 +64,7 @@ export function AccountsPage({
         </Button>
       </form>
       {addError ? <p className="field-error" role="alert">{addError}</p> : null}
+      {addNotice ? <p className="note" role="status">{addNotice}</p> : null}
       <p className="note">{t.keyHelp}</p>
       <p className="note">{t.poolHelp.replace("{n}", String(resting))}</p>
       {roster.length === 0 ? <p className="empty">{t.noAccounts}</p> : (

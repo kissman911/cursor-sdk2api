@@ -41,7 +41,7 @@
 
 ## 快速开始
 
-需要 Node.js 22.19 或更新版本、一把网关 Key，以及至少一个用于导入的 Cursor User API Key。
+需要 Node.js 22.19 或更新版本、一把网关 Key，以及至少一个用于导入的 Cursor 账号：可以是 Cursor User API Key，也可以是 `WorkosCursorSessionToken` cookie 值（`user_…::…`）——控制台只用它换取一把 User API Key，随后即丢弃。
 
 ```bash
 git clone https://github.com/Sunnyender-org/cursor-sdk2api.git
@@ -51,7 +51,7 @@ npm run build
 AUTH_MODE=managed GATEWAY_ACCESS_KEY='replace-me' node dist/index.js
 ```
 
-打开 [http://localhost:8080/console/](http://localhost:8080/console/)，导入一个或多个 Cursor 账号，之后所有账号统一使用同一把网关 Key：
+打开 [http://localhost:8080/console/](http://localhost:8080/console/)，导入一个或多个 Cursor 账号（API Key 或 `user_…::…` 会话 token 粘贴到同一个输入框即可），之后所有账号统一使用同一把网关 Key：
 
 ```bash
 curl http://localhost:8080/v1/models \

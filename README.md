@@ -40,7 +40,7 @@
 
 ## Quick start
 
-Requires Node.js 22.19 or newer, one gateway key, and at least one Cursor User API Key to import.
+Requires Node.js 22.19 or newer, one gateway key, and at least one Cursor account to import: either a Cursor User API Key, or a `WorkosCursorSessionToken` cookie value (`user_…::…`), which the console exchanges once for a User API Key and then discards.
 
 ```bash
 git clone https://github.com/Sunnyender-org/cursor-sdk2api.git
@@ -50,7 +50,7 @@ npm run build
 AUTH_MODE=managed GATEWAY_ACCESS_KEY='replace-me' node dist/index.js
 ```
 
-Open [http://localhost:8080/console/](http://localhost:8080/console/), import one or more Cursor accounts, then call every account through the same gateway key:
+Open [http://localhost:8080/console/](http://localhost:8080/console/), import one or more Cursor accounts (paste an API key or a `user_…::…` session token into the same box), then call every account through the same gateway key:
 
 ```bash
 curl http://localhost:8080/v1/models \

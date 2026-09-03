@@ -11,7 +11,7 @@
 
 ## Rules
 
-- Official `@cursor/sdk` only. Exact pin. No private H2, browser cookies, or copied gateway internals.
+- Official `@cursor/sdk` only. Exact pin. No private H2, browser cookies, or copied gateway internals on the data plane. A session token may only be exchanged once for an official User API Key at import time (`docs/SECURITY.md`), never stored or used to run models.
 - Fail closed on empty turns, unknown tool IDs, identity mismatch, and usage uncertainty.
 - Do not log secrets or raw tool payloads.
 - Keep the default profile free of ambient Cursor tools.

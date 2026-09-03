@@ -168,7 +168,14 @@ export function httpStatusOf(error: unknown): number {
 const SECRET_LIKE =
   /(sk-[A-Za-z0-9_-]{8,})|(Bearer\s+\S+)|(api[_-]?key["'\s:=]+)[^\s"',}]+/gi;
 const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi;
+// WorkosCursorSessionToken cookie values (`user_<id>::<jwt>`, possibly URL-encoded) and bare JWTs.
+const SESSION_TOKEN_LIKE = /user_[A-Za-z0-9]+(?:::|%3A%3A)[A-Za-z0-9._%-]+/gi;
+const JWT_LIKE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
 
 export function redactSecrets(text: string): string {
-  return text.replace(URL_CREDENTIALS, "$1[redacted]@").replace(SECRET_LIKE, "[redacted]");
+  return text
+    .replace(URL_CREDENTIALS, "$1[redacted]@")
+    .replace(SESSION_TOKEN_LIKE, "[redacted]")
+    .replace(JWT_LIKE, "[redacted]")
+    .replace(SECRET_LIKE, "[redacted]");
 }

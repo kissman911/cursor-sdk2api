@@ -11,6 +11,11 @@ import { classifyQuotaExhaustion } from "../auth/quota-cooldown.js";
 import { fetchCursorSandQuota } from "../account/cursor-dashboard.js";
 import { readAccount } from "../account/service.js";
 import {
+  looksLikeSessionToken,
+  mintUserApiKeyFromSessionToken,
+  type MintUserApiKeyResult,
+} from "../account/session-token.js";
+import {
   accountAvailability,
   CursorAccountFileStore,
   type StoredCursorAccount,
@@ -32,6 +37,7 @@ import type { SandLoaderHealth } from "../sdk/sand-loader.js";
 import { inspectSandInference } from "../sdk/sand-inference-runtime.js";
 import { SessionRegistry } from "../core/session-registry.js";
 import {
+  authenticationError,
   forbiddenError,
   GatewayError,
   invalidRequest,
@@ -140,6 +146,30 @@ function staleCredentialSessionError(error: unknown): boolean {
   return !/invalid|revoked|expired|disabled|unauthorized api key/i.test(error.message);
 }
 
+function sessionTokenImportError(result: Extract<MintUserApiKeyResult, { ok: false }>): GatewayError {
+  switch (result.reason) {
+    case "session_token_malformed":
+      return invalidRequest(
+        "session_token is not a Cursor session token (expected user_...::<jwt>, the WorkosCursorSessionToken cookie value)",
+      );
+    case "session_token_expired":
+      return invalidRequest("session_token has expired; sign in to cursor.com again and copy a fresh token");
+    // Wording avoids "API Key <word>", which the legacy redactor would blank out.
+    case "session_token_rejected":
+      return authenticationError(
+        `Cursor rejected the session token (status ${result.status ?? "unknown"}); sign in to cursor.com again or import a User API Key`,
+      );
+    case "mint_invalid_response":
+      return upstreamError("Cursor Dashboard returned an invalid response to CreateUserApiKey", 502);
+    case "mint_unavailable":
+    default:
+      return upstreamError(
+        `Cursor Dashboard could not mint a key for this session token${result.status ? ` (status ${result.status})` : ""}`,
+        502,
+      );
+  }
+}
+
 export function createApp(input: {
   config: GatewayConfig;
   sdk: SdkRuntime;
@@ -150,9 +180,13 @@ export function createApp(input: {
   fetchSandQuota?: typeof fetchCursorSandQuota;
   sandHealth?: SandLoaderHealth;
   assertSandAccess?: (apiKey: string) => Promise<void>;
+  /** Test seam: exchange a session token for a User API Key without the network. */
+  mintApiKeyFromSessionToken?: (token: string) => Promise<MintUserApiKeyResult>;
 }): App {
   const { config, sdk, clock, logger, workspaceDir, beforeApplyBoundary } = input;
   const fetchSandQuota = input.fetchSandQuota ?? fetchCursorSandQuota;
+  const mintApiKeyFromSessionToken =
+    input.mintApiKeyFromSessionToken ?? ((token: string) => mintUserApiKeyFromSessionToken(token));
   const sandHealth = input.sandHealth ?? inspectSandInference();
   const assertSandAccess = input.assertSandAccess ?? (async (apiKey: string) => {
     const quota = await fetchSandQuota(apiKey);
@@ -624,9 +658,31 @@ export function createApp(input: {
           return;
         }
         if (method === "POST") {
-          const body = await readJsonBody(req, config.maxBodyBytes) as { api_key?: unknown } | undefined;
+          const body = await readJsonBody(req, config.maxBodyBytes) as
+            | { api_key?: unknown; session_token?: unknown }
+            | undefined;
           const apiKey = typeof body?.api_key === "string" ? body.api_key.trim() : "";
-          if (!apiKey) throw invalidRequest("api_key is required");
+          const explicitToken = typeof body?.session_token === "string" ? body.session_token.trim() : "";
+          // A cookie value pasted into the API-key field still takes the mint path.
+          const sessionToken = explicitToken || (apiKey && looksLikeSessionToken(apiKey) ? apiKey : "");
+          if (sessionToken) {
+            const minted = await mintApiKeyFromSessionToken(sessionToken);
+            if (!minted.ok) throw sessionTokenImportError(minted);
+            const account = accounts.add(minted.apiKey);
+            logger.info({ account_id: account.id }, "managed account imported from a Cursor session token");
+            sendJson(
+              res,
+              201,
+              {
+                account: publicAccount(account),
+                minted_api_key: true,
+                ...(minted.email ? { email: minted.email } : {}),
+              },
+              requestId,
+            );
+            return;
+          }
+          if (!apiKey) throw invalidRequest("Provide session_token (user_...::<jwt>) or api_key");
           const account = accounts.add(apiKey);
           sendJson(
             res,

@@ -27,7 +27,7 @@ Read `docs/SECURITY.md` before changing credentials, account pooling, state, log
 - Never log API keys, cookies, prompts, thinking, tool schemas, arguments, or results.
 - `STATE_DIR` is sensitive owner-only state.
 - The management API and console must remain loopback-only unless an authenticated reverse proxy is explicitly designed and approved.
-- Browser cookies, private Cursor HTTP protocols, and BeefAPI user tokens are forbidden.
+- Browser cookies, private Cursor HTTP protocols, and BeefAPI user tokens are forbidden on the data plane. The only exception is account import: a `WorkosCursorSessionToken` value may be exchanged once, in memory, for an official User API Key via `DashboardService/CreateUserApiKey`; the token is never stored, logged, or used to run models.
 
 ## Source and verification
 

@@ -141,8 +141,9 @@ const COPY = {
       headers: ["Account", "Quota", "Fable 5", "Probe"] as [string, string, string, string],
       add: "Add",
       adding: "Adding",
-      keyPlaceholder: "Cursor API key",
-      keyHelp: "Stored by the gateway in STATE_DIR/auths with owner-only file permissions.",
+      keyPlaceholder: "Cursor API key, or a user_…::… session token",
+      keyHelp: "Stored by the gateway in STATE_DIR/auths with owner-only file permissions. A WorkosCursorSessionToken cookie value (user_…::…) is exchanged once for a new Cursor API key; the token itself is never stored.",
+      mintedNotice: "Session token exchanged for a new Cursor API key{email}. The token was not stored.",
       remove: "Remove",
       poolHelp: "Accounts that run out of quota rest automatically until Cursor's reset time; disabled or resting accounts are skipped for new sessions ({n} currently out of rotation).",
       stateDisabled: "Disabled",
@@ -206,7 +207,7 @@ const COPY = {
       workspaceBody:
         "Grok Build and Claude Code edit files with their own local tools in your project directory. This gateway only runs the model. Cursor SDK uses an empty workspace, so the model may emit that absolute path. Use a relative path or your project path.",
     },
-    keyNeeded: "Paste a Cursor API key first.",
+    keyNeeded: "Paste a Cursor API key or session token first.",
   },
   zh: {
     skip: "跳到主要内容",
@@ -320,8 +321,9 @@ const COPY = {
       headers: ["账号", "额度", "Fable 5", "测通"] as [string, string, string, string],
       add: "加入",
       adding: "加入中",
-      keyPlaceholder: "Cursor API Key",
-      keyHelp: "账号由网关写入 STATE_DIR/auths，并使用仅属主可读写的文件权限。",
+      keyPlaceholder: "Cursor API Key，或 user_…::… 会话 token",
+      keyHelp: "账号由网关写入 STATE_DIR/auths，并使用仅属主可读写的文件权限。粘贴 WorkosCursorSessionToken cookie 值（user_…::…）时，网关只用它换取一把新的 Cursor API Key，token 本身不会保存。",
+      mintedNotice: "已用会话 token 换取新的 Cursor API Key{email}，token 本身未保存。",
       remove: "移除",
       poolHelp: "额度用尽的账号会自动休息到 Cursor 的重置时间；已停用或休息中的账号不会再被新会话选中（当前 {n} 个未参与轮询）。",
       stateDisabled: "已停用",
@@ -385,7 +387,7 @@ const COPY = {
       workspaceBody:
         "Grok Build / Claude Code 改文件用的是它们自己的本机工具，工作区是你的项目目录。这个网关只提供模型推理。Cursor SDK 的 cwd 是空目录，所以模型有时会吐出网关绝对路径。写相对路径或你的项目路径就能改本地文件。",
     },
-    keyNeeded: "先粘贴一把 Cursor Key。",
+    keyNeeded: "先粘贴一把 Cursor Key 或会话 token。",
   },
 } as const;
 
@@ -403,6 +405,7 @@ export function App() {
   const [roster, setRoster] = useState<RosterItem[]>([]);
   const [draftKey, setDraftKey] = useState("");
   const [addError, setAddError] = useState("");
+  const [addNotice, setAddNotice] = useState("");
   const [adding, setAdding] = useState(false);
   const [activeId, setActiveId] = useState("");
   const [protocol, setProtocol] = useState<Protocol>("messages");
@@ -548,8 +551,10 @@ export function App() {
     }
     setAdding(true);
     setAddError("");
+    setAddNotice("");
     try {
-      const account = await addManagedAccount(key);
+      const added = await addManagedAccount(key);
+      const account = added.account;
       const next: RosterItem = {
         id: account.id,
         keyHint: account.key_hint,
@@ -560,6 +565,9 @@ export function App() {
       setRoster((current) => current.some((item) => item.id === next.id) ? current : [...current, next]);
       setActiveId(next.id);
       setDraftKey("");
+      if (added.minted_api_key) {
+        setAddNotice(t.home.mintedNotice.replace("{email}", added.email ? ` (${added.email})` : ""));
+      }
       await probe(next.id);
     } catch (error) {
       setAddError(messageOf(error));
@@ -739,6 +747,7 @@ export function App() {
             poolState={poolStateCopy}
             draftKey={draftKey}
             addError={addError}
+            addNotice={addNotice}
             adding={adding}
             roster={roster}
             onDraft={setDraftKey}

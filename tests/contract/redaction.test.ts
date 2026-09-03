@@ -83,6 +83,25 @@ test("mid-stream SDK errors redact secret-like text", async () => {
   expect(body).toContain("[redacted]");
 });
 
+test("session tokens and JWTs are redacted from public errors", () => {
+  const segment = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const jwt = `${segment({ alg: "RS256", typ: "JWT" })}.${segment({ sub: "auth0|user_01REDACTME", exp: 1 })}.sig`;
+  const cookie = `user_01REDACTME000000000000000::${jwt}`;
+
+  const plain = redactSecrets(`import failed for ${cookie} sorry`);
+  expect(plain).toBe("import failed for [redacted] sorry");
+
+  const encoded = redactSecrets(`cookie=${cookie.replace("::", "%3A%3A")};`);
+  expect(encoded).not.toContain("user_01REDACTME");
+  expect(encoded).not.toContain("eyJ");
+
+  const bare = redactSecrets(`token ${jwt} rejected`);
+  expect(bare).toBe("token [redacted] rejected");
+
+  // Ordinary identifiers that merely start with user_ are left alone.
+  expect(redactSecrets("user_id=42 user_01ABC")).toBe("user_id=42 user_01ABC");
+});
+
 test("proxy URL credentials are redacted from public errors", () => {
   const raw = "proxy failed at http://proxy-user:proxy-password@127.0.0.1:7890";
   const redacted = redactSecrets(raw);

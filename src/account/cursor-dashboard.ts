@@ -159,7 +159,7 @@ function ownStringArray(record: Record<string, unknown>, key: string): string[] 
   return value.map((entry) => String(entry ?? "").trim()).filter(Boolean);
 }
 
-async function readLimitedJson(response: Response): Promise<Record<string, unknown>> {
+export async function readLimitedJson(response: Response): Promise<Record<string, unknown>> {
   const reader = response.body?.getReader();
   if (!reader) return {};
   const chunks: Uint8Array[] = [];
