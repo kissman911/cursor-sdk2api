@@ -1,5 +1,11 @@
 import { digestJson, sha256Hex, stableStringify } from "../digest.js";
-import { asBlocks, collectImages } from "../protocols/anthropic/parse.js";
+import { invalidRequest } from "../errors.js";
+import {
+  asBlocks,
+  collectImages,
+  TRAILING_SYSTEM_TEXT_MARKER,
+  trailingSystemText,
+} from "../protocols/anthropic/parse.js";
 import type {
   AnthropicContentBlock,
   AnthropicMessage,
@@ -198,6 +204,26 @@ export function currentTurnFromMessage(message: AnthropicMessage | undefined): {
   };
 }
 
+/**
+ * The turn that is sent to the Agent: the last user message plus any
+ * in-conversation `system` / `developer` messages that trail it, delivered
+ * under a marker because the SDK has no mid-conversation system slot.
+ */
+function currentTurnFromConversation(
+  conversation: AnthropicMessage[],
+  userIndex: number,
+): { text: string; images: Array<{ data: string; mimeType: string }> } {
+  const current = currentTurnFromMessage(userIndex >= 0 ? conversation[userIndex] : undefined);
+  if (userIndex < 0) return current;
+  const trailing = trailingSystemText(conversation, userIndex);
+  if (!trailing) return current;
+  const attached = `${TRAILING_SYSTEM_TEXT_MARKER}\n${trailing}`;
+  return {
+    text: current.text ? `${current.text}\n\n${attached}` : attached,
+    images: current.images,
+  };
+}
+
 function lastUserIndex(conversation: AnthropicMessage[]): number {
   for (let index = conversation.length - 1; index >= 0; index -= 1) {
     if (conversation[index]?.role === "user") return index;
@@ -244,11 +270,22 @@ export function cursorAgentTurnLineageKey(turn: CursorAgentTurn): string {
 }
 
 export function nextCursorAgentTurnLineageKey(turn: CursorAgentTurn, assistantAnchor: string): string {
-  const historyAfterUser = advanceHistoryDigest(
-    turn.lineage.historyDigest,
-    "user",
-    digestAssistantAnchor(turn.conversation[lastUserIndex(turn.conversation)]?.content),
-  );
+  // Fold the current user turn and every message the client sent after it
+  // (in-conversation system reminders) so the successor request, whose history
+  // contains those same messages, still hashes to this key.
+  const userIndex = lastUserIndex(turn.conversation);
+  let historyAfterUser = turn.lineage.historyDigest;
+  if (userIndex < 0) {
+    historyAfterUser = advanceHistoryDigest(historyAfterUser, "user", digestAssistantAnchor(undefined));
+  }
+  for (let index = userIndex; userIndex >= 0 && index < turn.conversation.length; index += 1) {
+    const message = turn.conversation[index]!;
+    historyAfterUser = advanceHistoryDigest(
+      historyAfterUser,
+      message.role,
+      digestAssistantAnchor(message.content),
+    );
+  }
   const historyAfterAssistant = advanceHistoryDigest(historyAfterUser, "assistant", assistantAnchor);
   return digestJson({
     tenantScope: turn.tenantScope,
@@ -269,10 +306,9 @@ export function cursorAgentTurnFromParsed(
 ): CursorAgentTurn {
   const conversation = parsed.messages;
   const userIndex = lastUserIndex(conversation);
-  const currentMessage = userIndex >= 0 ? conversation[userIndex] : undefined;
   const parent = userIndex >= 0 ? parentAssistantMessage(conversation, userIndex) : null;
   const tools = normalizeTools(parsed.tools);
-  const currentTurn = currentTurnFromMessage(currentMessage);
+  const currentTurn = currentTurnFromConversation(conversation, userIndex);
   const turnIndex = conversation.filter((message) => message.role === "user").length;
   const toolCatalogDigest = digestToolCatalog(tools);
   const turn: CursorAgentTurn = {
@@ -307,16 +343,61 @@ export function cursorAgentTurnFromParsed(
   return turn;
 }
 
+/**
+ * Reject an ordinary (non tool_result) turn that cannot be delivered to a
+ * Cursor Agent as a new user message. The turn being judged is the last user
+ * message; in-conversation `system` / `developer` messages may trail it.
+ *
+ * - A transcript that ends on an assistant message asks for prefill
+ *   continuation, which the SDK cannot do. Sending the previous user turn
+ *   again would fork or duplicate the Agent's run, so it fails closed.
+ * - An empty current user turn would reach the model as a blank message, which
+ *   it sees as an "(omitted)" user turn and answers instead of continuing.
+ * - A user turn that skips the assistant's open tool_use batch has no legal
+ *   place to deliver results to; the pending batch must be answered with
+ *   tool_result blocks, exactly as the upstream Anthropic API demands.
+ */
+export function assertOrdinaryTurnDeliverable(turn: CursorAgentTurn): void {
+  const conversation = turn.conversation;
+  const terminal = conversation.at(-1);
+  if (!terminal) return;
+  if (terminal.role === "assistant") {
+    throw invalidRequest(
+      "the conversation must end with a user turn; assistant prefill continuation is not supported",
+    );
+  }
+  const userIndex = lastUserIndex(conversation);
+  if (userIndex < 0) return;
+  const userTurn = currentTurnFromMessage(conversation[userIndex]);
+  if (!userTurn.text && userTurn.images.length === 0) {
+    throw invalidRequest("the latest user turn is empty; it must carry text, an image, or tool_result blocks");
+  }
+  for (let index = userIndex - 1; index >= 0; index -= 1) {
+    const message = conversation[index]!;
+    if (message.role === "tool" || message.role === "function") return;
+    const blocks = asBlocks(message.content);
+    if (message.role === "user" && blocks.some((block) => block.type === "tool_result")) return;
+    if (message.role === "assistant" && blocks.some((block) => block.type === "tool_use")) {
+      throw invalidRequest(
+        "assistant tool_use blocks must be answered with tool_result blocks before a new user turn",
+      );
+    }
+  }
+}
+
 export function currentTurnSendPayload(turn: CursorAgentTurn): {
   text: string;
   images: Array<{ data: string; mimeType: string }>;
 } {
   const images = turn.currentTurn.images;
   const text = turn.currentTurn.text.trim();
-  return {
-    text: text || " ",
-    images,
-  };
+  // Never hand the SDK a blank user message: the model sees it as an "(omitted)"
+  // user turn and answers that instead of continuing the conversation.
+  if (!text && images.length === 0) {
+    throw invalidRequest("the current user turn must carry text or an image to be sent to the Cursor Agent");
+  }
+  // An image-only turn keeps the SDK's non-empty text requirement satisfied.
+  return { text: text || " ", images };
 }
 
 export function ordinaryReplayKey(turn: CursorAgentTurn): string {

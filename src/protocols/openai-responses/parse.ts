@@ -7,7 +7,13 @@ import {
   isHostedWebSearchTool,
 } from "../../core/hosted-search.js";
 import type { HostedSearchMode } from "../../core/runtime-profile.js";
-import { collectImages, parseContinuation, parseModelParams } from "../anthropic/parse.js";
+import {
+  collectImages,
+  currentUserTurnIndex,
+  parseContinuation,
+  parseModelParams,
+  trailingSystemText,
+} from "../anthropic/parse.js";
 import type {
   AnthropicContentBlock,
   AnthropicMessage,
@@ -74,8 +80,10 @@ export function parseResponsesRequest(
   }
 
   const lastUser = [...messages].reverse().find((message) => message.role === "user");
-  const terminal = messages.at(-1);
-  const continuation = terminal?.role === "user" ? parseContinuation(terminal) : undefined;
+  const userIndex = currentUserTurnIndex(messages);
+  const continuation = userIndex >= 0
+    ? parseContinuation(messages[userIndex]!, trailingSystemText(messages, userIndex))
+    : undefined;
   const images = collectImages(messages);
   const toolChoice = parseOpenAiToolChoice(
     raw.tool_choice,

@@ -21,8 +21,10 @@ Outer agents (Claude Code, Grok Build) execute their own local file tools in the
 | images (base64) | yes | Mapped to SDK `images` |
 | client tools | yes | `local.customTools` |
 | parallel tools | yes | One assistant batch |
-| tool continuation | yes | Latest user turn must be only `tool_result` |
-| mixed text + tool_result | no | `422 invalid_request` |
+| tool continuation | yes | The last user turn carries the `tool_result` batch; in-conversation `system` / `developer` messages may trail it (Claude Code 2.1 appends its task reminder there). An open assistant `tool_use` batch that the next user turn does not answer, or an empty latest user turn, is `422 invalid_request`; a new user turn aimed at an Agent that is still awaiting tool results is `409 cursor_session_conflict`. The pending batch is never forked or blank-resumed. |
+| mixed text + tool_result | yes | Text (for example Claude Code `<system-reminder>` blocks) and images in the same user turn ride along with the last `tool_result` under `[Additional user message delivered with these tool results]`; other block types are `422 invalid_request` |
+| in-conversation `system` / `developer` after the current user turn | yes | Delivered with that turn under `[System message delivered alongside this user turn]` (attached to the last `tool_result` on a continuation, appended to the user text otherwise); the lineage digest folds them so the exact-successor Agent reuse still matches on the next turn. The SDK has no mid-conversation system slot, so the role is not preserved. |
+| transcript ending on an assistant message (prefill) | no | `422 invalid_request`; the SDK cannot continue a partial assistant message and re-sending the previous user turn would fork the Agent's run |
 | usage / cache | pass-through | Final-only cumulative; omit missing fields |
 | ordinary next turn without session header | yes | Exact transcript lineage reuses the Agent and sends only the current user turn. Unknown, forked, compacted, or mismatched requests cold-rebuild. `ORDINARY_TURN_COORDINATOR=0` disables this. |
 | completed `x-cursor-session-id` follow-up | yes | Store + `Agent.resume` within TTL |

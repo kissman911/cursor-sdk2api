@@ -19,6 +19,7 @@ import { renderPrompt } from "../protocols/anthropic/parse.js";
 import { createAnthropicWriter } from "../protocols/anthropic/writer.js";
 import type { SdkRuntime } from "../sdk/port.js";
 import {
+  assertOrdinaryTurnDeliverable,
   currentTurnSendPayload,
   cursorAgentTurnFromParsed,
   cursorAgentTurnLineageKey,
@@ -161,6 +162,8 @@ export class RunCoordinator {
       tenantScope: auth.fingerprint,
       runtimeProfile: this.requestProfile(req, auth),
     });
+    // Fail closed before any Agent is created, resumed, or sent to.
+    assertOrdinaryTurnDeliverable(turn);
     if (this.deps.config.ordinaryTurnCoordinator && this.deps.ordinaryJournal) {
       const handled = await this.handleOrdinaryTurn(
         req,
@@ -396,6 +399,16 @@ export class RunCoordinator {
       }
       if (live?.agent && live.credentialFingerprint !== auth.fingerprint) {
         resume = false;
+      } else if (live && ownsOpenRun(live)) {
+        // The parent's Agent is still bound to a pending tool batch or a live
+        // run. Resuming it would open a second run on the same conversation
+        // (the "(omitted)" blank-turn fork); the client must answer the
+        // pending batch, or wait, instead.
+        throw sessionConflict(
+          live.state === "awaiting_tool_results"
+            ? "the matching Cursor Agent is still awaiting tool results; answer its pending tool_use batch with tool_result blocks instead of a new user turn"
+            : "the matching Cursor Agent already has an active run",
+        );
       } else if (
         claim.parent.agentId &&
         claim.parent.credentialFingerprint === auth.fingerprint
@@ -1582,6 +1595,16 @@ function recoveredToolResultPrompt(record: LineageRecord, results: ParsedToolRes
     "Do not repeat the completed tool calls. You may call other tools only if the task still requires them.",
     ...lines,
   ].join("\n");
+}
+
+/** A session whose Agent cannot take a new user turn without forking its run. */
+function ownsOpenRun(session: Session): boolean {
+  return (
+    session.state === "awaiting_tool_results" ||
+    session.state === "creating" ||
+    session.state === "running" ||
+    session.state === "resuming"
+  );
 }
 
 function isTranscriptRecoverableRoutingError(error: unknown): error is GatewayError {
