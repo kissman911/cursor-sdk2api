@@ -37,7 +37,10 @@ export function parseMessagesRequest(body: unknown): ParsedMessages {
   if (terminal?.role === "tool" || terminal?.role === "function") {
     throw invalidRequest(`trailing ${terminal.role} message requires tool_call_id, call_id, or id`);
   }
-  const continuation = terminal?.role === "user" ? parseContinuation(terminal) : undefined;
+  const userIndex = currentUserTurnIndex(messages);
+  const continuation = userIndex >= 0
+    ? parseContinuation(messages[userIndex]!, trailingSystemText(messages, userIndex))
+    : undefined;
   const images = collectImages(messages);
   const toolChoice = parseAnthropicToolChoice(
     raw.tool_choice,
@@ -255,7 +258,51 @@ function parseSystem(value: unknown): string {
  */
 export const ATTACHED_CONTINUATION_TEXT_MARKER = "[Additional user message delivered with these tool results]";
 
-export function parseContinuation(lastUser: AnthropicMessage): ParsedToolResult[] | undefined {
+/**
+ * Marker under which in-conversation `system` / `developer` messages that
+ * trail the current user turn are delivered. Claude Code 2.1 emits its
+ * periodic reminders (task list, skills, agents) as `role: "system"` entries
+ * inside `messages`, after the user turn they belong to. The Cursor SDK has no
+ * mid-conversation system slot, so the text is delivered with that user turn
+ * instead of being dropped or mistaken for a new turn.
+ */
+export const TRAILING_SYSTEM_TEXT_MARKER = "[System message delivered alongside this user turn]";
+
+/**
+ * Index of the user turn the client is asking the model to answer: the last
+ * user message, provided only in-conversation `system` / `developer` messages
+ * follow it. A transcript that ends on an assistant message (prefill) or has
+ * no user message yields -1.
+ */
+export function currentUserTurnIndex(messages: AnthropicMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const role = messages[index]!.role;
+    if (role === "user") return index;
+    if (role !== "system" && role !== "developer") return -1;
+  }
+  return -1;
+}
+
+/** Text of the `system` / `developer` messages that follow the current user turn. */
+export function trailingSystemText(messages: AnthropicMessage[], userIndex: number): string {
+  return messages
+    .slice(userIndex + 1)
+    .filter((message) => message.role === "system" || message.role === "developer")
+    .map((message) =>
+      asBlocks(message.content)
+        .filter((block): block is Extract<AnthropicContentBlock, { type: "text" }> => block.type === "text")
+        .map((block) => block.text.trim())
+        .filter(Boolean)
+        .join("\n"),
+    )
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+export function parseContinuation(
+  lastUser: AnthropicMessage,
+  trailingSystem = "",
+): ParsedToolResult[] | undefined {
   const blocks = asBlocks(lastUser.content);
   const toolResults = blocks.filter(
     (block): block is Extract<AnthropicContentBlock, { type: "tool_result" }> => block.type === "tool_result",
@@ -275,9 +322,12 @@ export function parseContinuation(lastUser: AnthropicMessage): ParsedToolResult[
     .map((block) => block.text.trim())
     .filter(Boolean)
     .join("\n\n");
+  const last = results[results.length - 1]!;
   if (attachedText) {
-    const last = results[results.length - 1]!;
     last.content = `${last.content}\n\n${ATTACHED_CONTINUATION_TEXT_MARKER}\n${attachedText}`;
+  }
+  if (trailingSystem) {
+    last.content = `${last.content}\n\n${TRAILING_SYSTEM_TEXT_MARKER}\n${trailingSystem}`;
   }
   return results;
 }
@@ -323,8 +373,10 @@ export function renderPrompt(
     );
   }
   if (parsed.systemText) parts.push(`System:\n${parsed.systemText}`);
+  // The continuation user turn (and any system reminders trailing it) is
+  // delivered as tool results, not as transcript text.
   const messages = parsed.continuation && !options.includeContinuation
-    ? parsed.messages.slice(0, -1)
+    ? parsed.messages.slice(0, currentUserTurnIndex(parsed.messages))
     : parsed.messages;
   for (const message of messages) {
     const text = asBlocks(message.content)

@@ -1,5 +1,8 @@
 import { afterEach, expect, test } from "vitest";
-import { ATTACHED_CONTINUATION_TEXT_MARKER } from "../../src/protocols/anthropic/parse.js";
+import {
+  ATTACHED_CONTINUATION_TEXT_MARKER,
+  TRAILING_SYSTEM_TEXT_MARKER,
+} from "../../src/protocols/anthropic/parse.js";
 import { api, closeTestApp, startTestApp, weatherTool, type TestContext } from "../helpers/app.js";
 
 let ctx: TestContext;
@@ -394,6 +397,257 @@ test("text sharing a user turn with tool_result rides along with the last result
   expect(delivered[0]).toContain("72F");
   expect(delivered[0]).toContain(ATTACHED_CONTINUATION_TEXT_MARKER);
   expect(delivered[0]).toContain("<system-reminder>also do this</system-reminder>");
+});
+
+test("an in-conversation system message trailing the tool_result turn still continues the pending batch", async () => {
+  // Claude Code 2.1 shape: its periodic task reminder is appended as a
+  // `role: "system"` entry *after* the user turn that carries the tool results.
+  // Before the fix this request was not recognised as a continuation, matched the
+  // previous tool boundary as an exact successor, and reached the model as a
+  // blank user turn that it read as "(omitted)".
+  const { toolTurn, ids } = await openParallelBatch();
+
+  const continued = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: toolTurn.content },
+        {
+          role: "user",
+          content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "ok" })),
+        },
+        {
+          role: "system",
+          content: [{ type: "text", text: "This is a reminder that your task list is currently empty." }],
+        },
+      ],
+      tools,
+    }),
+  });
+  const final = (await continued.json()) as { content: Array<{ text?: string }>; stop_reason: string };
+  expect(continued.status).toBe(200);
+  expect(final.stop_reason).toBe("end_turn");
+  expect(final.content.some((block) => block.text === "done")).toBe(true);
+  expect(ctx.sdk.resumeCalls).toHaveLength(0);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(1);
+  for (const agent of ctx.sdk.agents) {
+    expect((agent.lastSend?.text ?? "").trim()).not.toBe("");
+  }
+  const delivered = ctx.sdk.agents[0]?.runs[0]?.capturedToolResults as string[];
+  expect(delivered).toHaveLength(3);
+  expect(delivered[2]).toContain("ok");
+  expect(delivered[2]).toContain(TRAILING_SYSTEM_TEXT_MARKER);
+  expect(delivered[2]).toContain("your task list is currently empty");
+  expect(delivered[0]).not.toContain(TRAILING_SYSTEM_TEXT_MARKER);
+  expect(
+    [...ctx.app.registry.sessions.values()].filter((session) => session.state === "awaiting_tool_results"),
+  ).toHaveLength(0);
+});
+
+test("a transcript that ends on an assistant message fails closed before any Agent is created", async () => {
+  ctx = await startTestApp();
+  const res = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "Here is what I found:" },
+      ],
+    }),
+  });
+  const body = (await res.json()) as { error: { type: string; message: string } };
+  expect(res.status).toBe(422);
+  expect(body.error.type).toBe("invalid_request");
+  expect(body.error.message).toContain("assistant prefill");
+  expect(ctx.sdk.createCalls).toHaveLength(0);
+});
+
+/**
+ * Open a parallel tool batch whose Agent has a second script queued, so a
+ * mis-routed follow-up that resumes the same Agent would visibly succeed.
+ */
+async function openParallelBatch() {
+  ctx = await startTestApp({
+    sdk: {
+      agentScripts: [
+        [
+          [
+            {
+              type: "tools",
+              calls: [
+                { name: "lookup", input: { q: "a" } },
+                { name: "lookup", input: { q: "b" } },
+                { name: "beta", input: { n: 3 } },
+              ],
+            },
+            { type: "text", chunks: ["done"] },
+          ],
+        ],
+        [[{ type: "text", chunks: ["forked-must-not-run"] }]],
+      ],
+    },
+  });
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "go" }],
+      tools,
+    }),
+  });
+  const toolTurn = (await first.json()) as {
+    stop_reason: string;
+    content: Array<{ type: string; id?: string; name?: string }>;
+  };
+  expect(first.status).toBe(200);
+  expect(toolTurn.stop_reason).toBe("tool_use");
+  const ids = toolTurn.content.filter((block) => block.type === "tool_use").map((block) => block.id as string);
+  expect(ids).toHaveLength(3);
+  return { toolTurn, ids };
+}
+
+function expectPendingBatchUntouched(ids: string[]) {
+  expect(ctx.sdk.resumeCalls).toHaveLength(0);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(1);
+  for (const agent of ctx.sdk.agents) {
+    expect((agent.lastSend?.text ?? "").trim()).not.toBe("");
+  }
+  const awaiting = [...ctx.app.registry.sessions.values()].filter(
+    (session) => session.state === "awaiting_tool_results",
+  );
+  expect(awaiting).toHaveLength(1);
+  expect(awaiting[0]?.unresolvedIds().sort()).toEqual([...ids].sort());
+}
+
+async function completePendingBatch(toolTurn: { content: unknown }, ids: string[]) {
+  const continued = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: toolTurn.content },
+        {
+          role: "user",
+          content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "ok" })),
+        },
+      ],
+      tools,
+    }),
+  });
+  const final = (await continued.json()) as { content: Array<{ text?: string }>; stop_reason: string };
+  expect(continued.status).toBe(200);
+  expect(final.stop_reason).toBe("end_turn");
+  expect(final.content.some((block) => block.text === "done")).toBe(true);
+  expect(ctx.sdk.agents).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(1);
+}
+
+test("an empty user turn after an open tool batch fails closed instead of resuming the pending Agent with a blank message", async () => {
+  const { toolTurn, ids } = await openParallelBatch();
+
+  // Claude Code shape that produced the "(omitted)" turn: the transcript ends on
+  // the assistant tool batch and the next user message carries no content.
+  const blank = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: toolTurn.content },
+        { role: "user", content: [] },
+      ],
+      tools,
+    }),
+  });
+  const body = (await blank.json()) as { error: { type: string } };
+  expect(blank.status).toBe(422);
+  expect(body.error.type).toBe("invalid_request");
+  expectPendingBatchUntouched(ids);
+
+  await completePendingBatch(toolTurn, ids);
+});
+
+test("a text-only user turn that ignores the open tool batch fails closed instead of forking the pending Agent", async () => {
+  const { toolTurn, ids } = await openParallelBatch();
+
+  const skipped = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: toolTurn.content },
+        { role: "user", content: "never mind, answer without the tools" },
+      ],
+      tools,
+    }),
+  });
+  const body = (await skipped.json()) as { error: { type: string } };
+  expect(skipped.status).toBe(422);
+  expect(body.error.type).toBe("invalid_request");
+  expectPendingBatchUntouched(ids);
+
+  await completePendingBatch(toolTurn, ids);
+});
+
+test("a tool_result turn followed by a trailing assistant message never resumes the pending Agent with a blank message", async () => {
+  const { toolTurn, ids } = await openParallelBatch();
+
+  const prefilled = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: toolTurn.content },
+        {
+          role: "user",
+          content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, content: "ok" })),
+        },
+        { role: "assistant", content: "Here is what I found:" },
+      ],
+      tools,
+    }),
+  });
+  const body = (await prefilled.json()) as { error: { type: string } };
+  expect([409, 422]).toContain(prefilled.status);
+  expect(["cursor_session_conflict", "invalid_request"]).toContain(body.error.type);
+  expectPendingBatchUntouched(ids);
+
+  await completePendingBatch(toolTurn, ids);
+});
+
+test("an empty latest user turn is rejected before any Agent is created", async () => {
+  ctx = await startTestApp();
+  for (const content of ["", "   ", [], [{ type: "text", text: "" }]]) {
+    const res = await api(ctx, "/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "composer-2.5",
+        max_tokens: 16,
+        messages: [{ role: "user", content }],
+      }),
+    });
+    const body = (await res.json()) as { error: { type: string } };
+    expect(res.status).toBe(422);
+    expect(body.error.type).toBe("invalid_request");
+  }
+  expect(ctx.sdk.createCalls).toHaveLength(0);
 });
 
 test("non-text blocks other than images cannot share a user turn with tool_result", async () => {

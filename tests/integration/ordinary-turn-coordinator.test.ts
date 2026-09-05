@@ -54,6 +54,56 @@ test("exact ordinary next turn reuses one Agent and sends only current text", as
   expect(ctx.sdk.agents[0]?.lastSend?.text).not.toContain("hello");
 });
 
+test("in-conversation system messages trailing a user turn are delivered and keep the exact lineage", async () => {
+  // Claude Code 2.1 sends its skill/agent listing and task reminders as
+  // `role: "system"` entries inside `messages`, right after the user turn.
+  ctx = await startTestApp({
+    sdk: {
+      scripts: [[{ type: "text", chunks: ["first"] }], [{ type: "text", chunks: ["second"] }]],
+    },
+  });
+  const first = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: [{ type: "text", text: "Available skills: alpha, beta." }] },
+      ],
+    }),
+  });
+  const firstBody = (await first.json()) as { content: Array<{ text?: string }> };
+  expect(first.status).toBe(200);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.lastSend?.text).toContain("Available skills: alpha, beta.");
+
+  const follow = await api(ctx, "/v1/messages", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "composer-2.5",
+      max_tokens: 16,
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "system", content: "Available skills: alpha, beta." },
+        { role: "assistant", content: firstBody.content[0]?.text ?? "first" },
+        { role: "user", content: "next" },
+        { role: "system", content: [{ type: "text", text: "Reminder: the task list is empty." }] },
+      ],
+    }),
+  });
+  expect(follow.status).toBe(200);
+  expect(ctx.sdk.createCalls).toHaveLength(1);
+  expect(ctx.sdk.resumeCalls).toHaveLength(0);
+  expect(ctx.sdk.agents).toHaveLength(1);
+  expect(ctx.sdk.agents[0]?.runs).toHaveLength(2);
+  const sent = ctx.sdk.agents[0]?.lastSend?.text ?? "";
+  expect(sent.startsWith("next")).toBe(true);
+  expect(sent).toContain("Reminder: the task list is empty.");
+  expect(sent).not.toContain("hello");
+  expect(sent).not.toContain("Available skills");
+});
+
 test("an explicit session follow-up never seeds headerless ordinary replay", async () => {
   ctx = await startTestApp({
     sdk: {
